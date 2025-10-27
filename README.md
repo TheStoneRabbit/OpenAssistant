@@ -9,8 +9,9 @@ This sketch turns an M5Stack Cardputer (ESP32-S3) into a handheld ChatGPT client
 - Optional voice input: hold the `GO` button while editing to record audio, transcribe it with OpenAI (`gpt-4o-mini-transcribe`), and append the text into your prompt.
 - `/context` command saves the current conversation to `transcripts/` on the SD card and starts a fresh session.
 - `/wifi` command scans for nearby networks and lets you connect/update the stored credentials if the SD config fails.
-- Live battery percentage in the status bar plus automatic screen sleep/wake after 1 minute of inactivity.
+- Live battery percentage in the header plus automatic screen sleep/wake after 1 minute of inactivity.
 - On-board status LED: steady green when idle, flashing blue while recording/transcribing or querying OpenAI.
+- Enlarged UI fonts with wrapped input text for easier reading on the small display.
 
 ## Hardware & Software Requirements
 - M5Stack Cardputer (ESP32-S3) with TinyUSB HID support enabled.
@@ -47,10 +48,11 @@ Lines starting with `#` are treated as comments. The file is read during boot; m
    - The whole chat history, including the system prompt, is written to `transcripts/context_<timestamp>.txt`.
    - A fresh conversation context is started automatically.
 6. After the assistant replies:
-   - `;` scrolls up, `.` scrolls down.
-   - `GO` types the full reply into the host computer via USB HID.
+   - `;` scrolls up and `.` scrolls down through the AI response.
+   - `,` or `/` toggles the view between the AI reply and your prompt.
+   - `GO` types the full AI reply into the host computer via USB HID.
    - `ENTER` exits view mode and returns to prompt editing.
-7. If you leave the device idle for ~1 minute the display sleeps to save power; press any key or button to wake it up (the UI restores automatically).
+7. If you leave the device idle for ~1 minute the display sleeps to save power; press any key or button to wake it up (the UI restores automatically). The RGB LED turns off while the screen is asleep.
 8. Watch the front RGB LED: solid green means idle, flashing blue means the device is busy (voice capture/transcription or OpenAI request).
 
 ## Troubleshooting

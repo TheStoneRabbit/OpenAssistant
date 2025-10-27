@@ -32,6 +32,7 @@
 #include <cstring>
 #include <cstdio>
 #include <ctype.h>
+#include <algorithm>
 #include <SD.h>
 #include <SPI.h>
 #include "esp32-hal-rgb-led.h"
@@ -69,6 +70,22 @@ const char*    TRANSCRIPT_DIR        = "/transcripts";
 
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 
+const int SCREEN_WIDTH       = 240;
+const int SCREEN_HEIGHT      = 135;
+const int HEADER_TEXT_SIZE   = 2;
+const int STATUS_TEXT_SIZE   = 2;
+const int CONTENT_TEXT_SIZE  = 2;
+const int PROMPT_TEXT_SIZE   = CONTENT_TEXT_SIZE;
+const int REPLY_TEXT_SIZE    = CONTENT_TEXT_SIZE;
+const int HEADER_HEIGHT      = HEADER_TEXT_SIZE * 12 + 8;
+const int STATUS_HEIGHT      = STATUS_TEXT_SIZE * 12 + 6;
+const int CONTENT_MARGIN_X   = 8;
+const int CONTENT_MARGIN_Y   = 4;
+const int CONTENT_LINE_EXTRA = 6;
+const int PROMPT_AREA_Y      = HEADER_HEIGHT + STATUS_HEIGHT + CONTENT_MARGIN_Y;
+const int PROMPT_AREA_HEIGHT = SCREEN_HEIGHT > PROMPT_AREA_Y ? SCREEN_HEIGHT - PROMPT_AREA_Y : 0;
+const int REPLY_AREA_Y       = PROMPT_AREA_Y;
+
 const uint32_t INACTIVITY_TIMEOUT_MS      = 60000;
 const uint32_t BATTERY_UPDATE_INTERVAL_MS = 5000;
 
@@ -76,6 +93,7 @@ const uint32_t BATTERY_UPDATE_INTERVAL_MS = 5000;
 
 WiFiClientSecure httpsClient;
 String inputBuffer = "";
+String lastUserPrompt = "";
 
 // Conversation memory
 struct ChatMessage {
@@ -90,6 +108,7 @@ int scrollOffset = 0;
 
 // Keep the last assistant reply so GO button can "type" it out
 String lastAssistantReply = "";
+String headerTitle = "Cardputer AI";
 String statusBaseLine = "";
 
 // Voice recording state (SD-backed)
@@ -101,6 +120,8 @@ bool displaySleeping = false;
 unsigned long lastActivityMs = 0;
 unsigned long lastBatteryUpdateMs = 0;
 bool sdMounted = false;
+unsigned long lastStatusScrollUpdateMs = 0;
+int statusScrollOffset = 0;
 
 // LED state
 int8_t boardLedPin = -1;
@@ -524,34 +545,33 @@ int getBatteryPercent() {
   return (int)constrain((int)(pct + 0.5f), 0, 100);
 }
 
-String composeStatusDisplay() {
-  String display = statusBaseLine;
+String batteryText() {
   int level = getBatteryPercent();
-  String battery = (level >= 0 && level <= 100) ? String(level) + "%" : "--%";
-  if (display.length() > 0) {
-    display += " ";
+  if (level >= 0 && level <= 100) {
+    return String(level) + "%";
   }
-  display += "[" + battery + "]";
-  return display;
+  return "--%";
 }
 
-void renderStatusLine(bool force = false) {
+void updateHeaderBattery() {
   if (displaySleeping) return;
-  unsigned long now = millis();
-  if (!force && (now - lastBatteryUpdateMs) < BATTERY_UPDATE_INTERVAL_MS) {
-    return;
-  }
-  String full = composeStatusDisplay();
-  M5Cardputer.Display.fillRect(0, 16, 320, 12, BLACK);
-  M5Cardputer.Display.setCursor(0, 16);
-  M5Cardputer.Display.setTextColor(YELLOW, BLACK);
-  M5Cardputer.Display.setTextSize(1);
-  M5Cardputer.Display.print(full);
-  lastBatteryUpdateMs = now;
+  M5Cardputer.Display.setTextSize(HEADER_TEXT_SIZE);
+  String batt = batteryText();
+  int padding = 4;
+  int width = M5Cardputer.Display.textWidth(batt.c_str());
+  int x = SCREEN_WIDTH - width - padding;
+  if (x < 0) x = 0;
+  M5Cardputer.Display.fillRect(x - 2, 0, width + padding + 2, HEADER_HEIGHT, BLUE);
+  M5Cardputer.Display.setCursor(x, 6);
+  M5Cardputer.Display.setTextColor(WHITE, BLUE);
+  M5Cardputer.Display.print(batt);
 }
+
+void renderStatusLineInner(bool force);
+void renderStatusLine(bool force);
 
 void maybeUpdateBatteryIndicator() {
-  renderStatusLine(false);
+  renderStatusLineInner(false);
 }
 
 void markActivity() {
@@ -564,8 +584,13 @@ bool wakeDisplayIfNeeded() {
   M5Cardputer.Display.wakeup();
   M5Cardputer.Display.setBrightness(255);
   lcdClearAll();
-  lcdHeader("Cardputer AI Assistant");
-  renderStatusLine(true);
+  lcdHeader("Cardputer AI");
+  renderStatusLineInner(true);
+  if (ledAvailable && ledBusyDepth == 0) {
+    setLedColor(0, 255, 0);
+    ledBlinkState = true;
+    lastLedToggleMs = millis();
+  }
   return true;
 }
 
@@ -575,6 +600,10 @@ void checkDisplaySleep() {
   if (now - lastActivityMs >= INACTIVITY_TIMEOUT_MS) {
     displaySleeping = true;
     M5Cardputer.Display.sleep();
+    if (ledAvailable) {
+      setLedColor(0, 0, 0);
+      ledBlinkState = false;
+    }
   }
 }
 
@@ -609,15 +638,27 @@ void ledExitBusy() {
     ledBusyDepth--;
   }
   if (ledBusyDepth == 0) {
-    ledBlinkState = false;
-    lastLedToggleMs = millis();
-    setLedColor(0, 255, 0);
-    ledBlinkState = true;
+    if (displaySleeping) {
+      setLedColor(0, 0, 0);
+      ledBlinkState = false;
+    } else {
+      ledBlinkState = false;
+      lastLedToggleMs = millis();
+      setLedColor(0, 255, 0);
+      ledBlinkState = true;
+    }
   }
 }
 
 void maybeUpdateLed() {
   if (!ledAvailable) return;
+  if (displaySleeping) {
+    if (ledBlinkState) {
+      setLedColor(0, 0, 0);
+      ledBlinkState = false;
+    }
+    return;
+  }
   unsigned long now = millis();
   if (ledBusyDepth > 0) {
     if (now - lastLedToggleMs >= 300) {
@@ -652,6 +693,65 @@ bool stringIsDigits(const String& s) {
 template <typename KeyState>
 bool hasKeyboardActivity(const KeyState& ks) {
   return ks.enter || ks.del || !ks.word.empty();
+}
+
+int lineHeightForSize(int textSize) {
+  return (8 * textSize) + CONTENT_LINE_EXTRA;
+}
+
+std::vector<String> wrapTextToLines(const String& text, int maxWidth, int textSize) {
+  M5Cardputer.Display.setTextSize(textSize);
+  std::vector<String> lines;
+  String current = "";
+
+  for (int i = 0; i < text.length(); ++i) {
+    char c = text[i];
+    if (c == '\r') continue;
+    if (c == '\n') {
+      lines.push_back(current);
+      current = "";
+      continue;
+    }
+
+    String candidate = current;
+    candidate += c;
+    int width = M5Cardputer.Display.textWidth(candidate.c_str());
+    if (width > maxWidth && current.length() > 0) {
+      lines.push_back(current);
+      current = "";
+      if (c == ' ') {
+        continue;
+      }
+      candidate = String(c);
+      width = M5Cardputer.Display.textWidth(candidate.c_str());
+      if (width > maxWidth) {
+        lines.push_back(candidate);
+        continue;
+      }
+    }
+    current += c;
+  }
+
+  if (current.length() > 0) {
+    lines.push_back(current);
+  }
+
+  if (lines.empty()) {
+    lines.push_back("");
+  }
+
+  return lines;
+}
+
+int visibleReplyLines() {
+  int h = SCREEN_HEIGHT - REPLY_AREA_Y;
+  int lineHeight = lineHeightForSize(REPLY_TEXT_SIZE);
+  int available = h - lineHeight;
+  if (available < 0) available = 0;
+  int lines = available / lineHeight;
+  if (available == 0) lines = 1;
+  if (lines < 1) lines = 1;
+  return lines;
 }
 
 String readSimpleTextLine(const String& statusMsg) {
@@ -790,86 +890,141 @@ bool writeConfigToSD() {
 }
 
 void lcdHeader(const String& msg) {
-  // Top bar (0..14 px tall)
-  M5Cardputer.Display.fillRect(0, 0, 320, 14, BLUE);
-  M5Cardputer.Display.setCursor(2, 2);
+  headerTitle = msg;
+  M5Cardputer.Display.fillRect(0, 0, SCREEN_WIDTH, HEADER_HEIGHT, BLUE);
   M5Cardputer.Display.setTextColor(WHITE, BLUE);
-  M5Cardputer.Display.setTextSize(1);
-  M5Cardputer.Display.print(msg);
+  M5Cardputer.Display.setTextSize(HEADER_TEXT_SIZE);
+
+  String title = headerTitle;
+  int padding = 4;
+  String batt = batteryText();
+  int battWidth = M5Cardputer.Display.textWidth(batt.c_str());
+  int availableWidth = SCREEN_WIDTH - battWidth - padding * 2;
+  while (M5Cardputer.Display.textWidth(title.c_str()) > availableWidth && title.length() > 0) {
+    title.remove(title.length() - 1);
+  }
+  M5Cardputer.Display.setCursor(padding, 6);
+  M5Cardputer.Display.print(title);
+  updateHeaderBattery();
 }
 
 void lcdStatusLine(const String& msg) {
   statusBaseLine = msg;
-  renderStatusLine(true);
+  statusScrollOffset = 0;
+  lastStatusScrollUpdateMs = 0;
+  renderStatusLineInner(true);
 }
 
 void lcdShowPromptEditing(const String& current) {
-  // Draw the "You:" area at y=32
-  int startY = 32;
-  int h = 24;
-  M5Cardputer.Display.fillRect(0, startY, 320, h, BLACK);
+  int startY = PROMPT_AREA_Y;
+  M5Cardputer.Display.fillRect(0, startY, SCREEN_WIDTH, PROMPT_AREA_HEIGHT, BLACK);
 
-  M5Cardputer.Display.setCursor(0, startY);
+  M5Cardputer.Display.setTextSize(PROMPT_TEXT_SIZE);
   M5Cardputer.Display.setTextColor(CYAN, BLACK);
-  M5Cardputer.Display.setTextSize(1);
-  M5Cardputer.Display.print("You: ");
+  M5Cardputer.Display.setCursor(CONTENT_MARGIN_X, startY);
+  M5Cardputer.Display.print("You:");
 
-  // Show up to ~120 chars, then "..."
-  String clipped = current;
-  if (clipped.length() > 120) {
-    clipped = clipped.substring(0, 120) + "...";
-  }
+  int indent = CONTENT_MARGIN_X + M5Cardputer.Display.textWidth("You:") + (PROMPT_TEXT_SIZE * 6);
+  int textWidth = SCREEN_WIDTH - indent - CONTENT_MARGIN_X;
+  if (textWidth < 40) textWidth = 40;
+
+  auto lines = wrapTextToLines(current, textWidth, PROMPT_TEXT_SIZE);
+  int lineHeight = lineHeightForSize(PROMPT_TEXT_SIZE);
+  int maxLines = PROMPT_AREA_HEIGHT / lineHeight;
+  if (maxLines < 1) maxLines = 1;
+  int cursorLine = std::min((int)lines.size() - 1, maxLines - 1);
 
   M5Cardputer.Display.setTextColor(WHITE, BLACK);
-  M5Cardputer.Display.println(clipped);
-
-  M5Cardputer.Display.setTextColor(GREEN, BLACK);
-  M5Cardputer.Display.print("_");
+  for (int i = 0; i < maxLines && i < (int)lines.size(); ++i) {
+    int y = startY + i * lineHeight;
+    if (y >= startY + PROMPT_AREA_HEIGHT) break;
+    int x = indent;
+    String textLine = lines[i];
+    M5Cardputer.Display.setCursor(x, y);
+    M5Cardputer.Display.setTextColor(WHITE, BLACK);
+    M5Cardputer.Display.print(textLine);
+    if (i == cursorLine) {
+      int cursorX = x + M5Cardputer.Display.textWidth(textLine.c_str());
+      int cursorMax = SCREEN_WIDTH - CONTENT_MARGIN_X - (PROMPT_TEXT_SIZE * 6);
+      if (cursorX > cursorMax) cursorX = cursorMax;
+      M5Cardputer.Display.setCursor(cursorX, y);
+      M5Cardputer.Display.setTextColor(GREEN, BLACK);
+      M5Cardputer.Display.print("_");
+      M5Cardputer.Display.setTextColor(WHITE, BLACK);
+    }
+  }
 }
 
 // Convert the assistant's full reply string into wrapped lines
 // and reset scrollOffset.
 void prepareReplyLinesFromText(const String& replyText) {
-  replyLines.clear();
-  scrollOffset = 0;
-
-  const int wrapWidth = 28; // ~28 chars wide for size=1 font
-  int len = replyText.length();
-
-  for (int i = 0; i < len; i += wrapWidth) {
-    int endIdx = i + wrapWidth;
-    if (endIdx > len) endIdx = len;
-    replyLines.push_back(replyText.substring(i, endIdx));
+  replyLines = wrapTextToLines(replyText, SCREEN_WIDTH - CONTENT_MARGIN_X * 2, CONTENT_TEXT_SIZE);
+  if (replyLines.empty()) {
+    replyLines.push_back("");
   }
+  scrollOffset = 0;
 }
 
 // Render the assistant reply window starting at scrollOffset
 void lcdShowAssistantReplyWindow() {
-  int startY = 64;
-  int h = 240 - startY;
+  int startY = REPLY_AREA_Y;
+  int h = SCREEN_HEIGHT - startY;
+  if (h < 0) h = 0;
 
-  // Clear area
-  M5Cardputer.Display.fillRect(0, startY, 320, h, BLACK);
+  M5Cardputer.Display.fillRect(0, startY, SCREEN_WIDTH, h, BLACK);
 
-  // "AI:" label
-  M5Cardputer.Display.setCursor(0, startY);
-  M5Cardputer.Display.setTextSize(1);
+  M5Cardputer.Display.setTextSize(REPLY_TEXT_SIZE);
   M5Cardputer.Display.setTextColor(GREEN, BLACK);
+  M5Cardputer.Display.setCursor(CONTENT_MARGIN_X, startY);
   M5Cardputer.Display.println("AI:");
 
-  // Body lines
-  M5Cardputer.Display.setTextColor(WHITE, BLACK);
+  int lineHeight = lineHeightForSize(REPLY_TEXT_SIZE);
+  int contentStartY = startY + lineHeight;
+  int maxLinesOnScreen = visibleReplyLines();
+  int maxOffset = (int)replyLines.size() - maxLinesOnScreen;
+  if (maxOffset < 0) maxOffset = 0;
+  if (scrollOffset > maxOffset) scrollOffset = maxOffset;
 
-  const int maxLinesOnScreen = 10; // lines that can fit below "AI:"
-  for (int i = 0; i < maxLinesOnScreen; i++) {
+  M5Cardputer.Display.setTextColor(WHITE, BLACK);
+  for (int i = 0; i < maxLinesOnScreen; ++i) {
     int idx = scrollOffset + i;
     if (idx < 0 || idx >= (int)replyLines.size()) break;
-    M5Cardputer.Display.println(replyLines[idx]);
+    int y = contentStartY + i * lineHeight;
+    if (y >= SCREEN_HEIGHT) break;
+    M5Cardputer.Display.setCursor(CONTENT_MARGIN_X, y);
+    M5Cardputer.Display.print(replyLines[idx]);
   }
+}
 
-  // footer / hint
-  M5Cardputer.Display.setTextColor(YELLOW, BLACK);
-  M5Cardputer.Display.println("[; up / . down | GO send | ENTER exit]");
+void lcdShowUserPromptView() {
+  int startY = REPLY_AREA_Y;
+  int h = SCREEN_HEIGHT - startY;
+  if (h < 0) h = 0;
+
+  M5Cardputer.Display.fillRect(0, startY, SCREEN_WIDTH, h, BLACK);
+
+  M5Cardputer.Display.setTextSize(REPLY_TEXT_SIZE);
+  M5Cardputer.Display.setTextColor(CYAN, BLACK);
+  M5Cardputer.Display.setCursor(CONTENT_MARGIN_X, startY);
+  M5Cardputer.Display.println("You:");
+
+  String promptText = lastUserPrompt;
+  if (promptText.isEmpty()) {
+    promptText = "(no prompt)";
+  }
+  auto lines = wrapTextToLines(promptText, SCREEN_WIDTH - CONTENT_MARGIN_X * 2, REPLY_TEXT_SIZE);
+  int lineHeight = lineHeightForSize(REPLY_TEXT_SIZE);
+  int contentStartY = startY + lineHeight;
+  int maxLinesOnScreen = visibleReplyLines();
+
+  M5Cardputer.Display.setTextColor(WHITE, BLACK);
+  for (int i = 0; i < maxLinesOnScreen; ++i) {
+    if (i >= (int)lines.size()) break;
+    int y = contentStartY + i * lineHeight;
+    if (y >= SCREEN_HEIGHT) break;
+    M5Cardputer.Display.setCursor(CONTENT_MARGIN_X, y);
+    M5Cardputer.Display.print(lines[i]);
+  }
 }
 
 // ------------------------------------------------------------
@@ -923,20 +1078,31 @@ bool wifiInteractiveSetup() {
 
   lcdClearAll();
   lcdHeader("WiFi Networks");
-  M5Cardputer.Display.setCursor(0, 32);
-  int maxDisplay = networkCount < 10 ? networkCount : 10;
+  int maxDisplay = networkCount < 6 ? networkCount : 6;
+  int listY = PROMPT_AREA_Y;
+  int lineHeight = lineHeightForSize(CONTENT_TEXT_SIZE);
+  M5Cardputer.Display.setTextSize(CONTENT_TEXT_SIZE);
+  M5Cardputer.Display.setTextColor(WHITE, BLACK);
   for (int i = 0; i < maxDisplay; ++i) {
+    int y = listY + i * lineHeight;
+    if (y >= SCREEN_HEIGHT) break;
     String line = String(i) + ": " + WiFi.SSID(i);
     if (WiFi.encryptionType(i) != WIFI_AUTH_OPEN) {
       line += " *";
     }
-    if (line.length() > 28) {
-      line = line.substring(0, 28);
+    const int maxChars = 16;
+    if (line.length() > maxChars) {
+      line = line.substring(0, maxChars - 3) + "...";
     }
-    M5Cardputer.Display.println(line);
+    M5Cardputer.Display.setCursor(CONTENT_MARGIN_X, y);
+    M5Cardputer.Display.print(line);
   }
   if (networkCount > maxDisplay) {
-    M5Cardputer.Display.println("... (" + String(networkCount - maxDisplay) + " more)");
+    int y = listY + maxDisplay * lineHeight;
+    if (y < SCREEN_HEIGHT) {
+      M5Cardputer.Display.setCursor(CONTENT_MARGIN_X, y);
+      M5Cardputer.Display.print("... (" + String(networkCount - maxDisplay) + " more)");
+    }
   }
 
   String selection = readSimpleTextLine("Select network # or name (blank=cancel)");
@@ -1232,8 +1398,17 @@ void typeReplyOverUSB(const String& text) {
 // - ENTER exits back to prompt mode
 // ------------------------------------------------------------
 void viewAssistantReplyInteractive() {
-  lcdShowAssistantReplyWindow();
-  lcdStatusLine(";/.:scroll GO:type ENTER:exit");
+  auto showAssistant = [&]() {
+    lcdShowAssistantReplyWindow();
+    lcdStatusLine(";/.:scroll ,/:toggle GO:type ENTER:exit");
+  };
+  auto showUser = [&]() {
+    lcdShowUserPromptView();
+    lcdStatusLine(",/:toggle GO:type AI ENTER:exit");
+  };
+
+  bool showingAssistant = true;
+  showAssistant();
   markActivity();
 
   bool prevEnter = false;
@@ -1259,8 +1434,11 @@ void viewAssistantReplyInteractive() {
         continue;
       }
       wakeDisplayIfNeeded();
-      lcdShowAssistantReplyWindow();
-      lcdStatusLine(";/.:scroll GO:type ENTER:exit");
+      if (showingAssistant) {
+        showAssistant();
+      } else {
+        showUser();
+      }
       markActivity();
     }
 
@@ -1277,12 +1455,19 @@ void viewAssistantReplyInteractive() {
       // Send keystrokes over USB
       lcdStatusLine("Typing reply over HID...");
       typeReplyOverUSB(lastAssistantReply);
-      lcdStatusLine("Done. ;/.:scroll ENTER:exit");
+      if (showingAssistant) {
+        showAssistant();
+      } else {
+        showUser();
+      }
     }
     prevGo = goNow;
 
     // -- SCROLL with ';' (up) / '.' (down) --
     std::vector<char> currHeld = ks.word;
+    int visibleLines = visibleReplyLines();
+    int maxOffset = (int)replyLines.size() - visibleLines;
+    if (maxOffset < 0) maxOffset = 0;
 
     for (char c_now : currHeld) {
       bool alreadyHeld = false;
@@ -1293,21 +1478,28 @@ void viewAssistantReplyInteractive() {
         }
       }
 
-      if (!alreadyHeld) {
-        // fresh press in scroll mode
-        if (c_now == ';') {
-          // scroll UP
-          if (scrollOffset > 0) {
+        if (!alreadyHeld) {
+          if (c_now == ',' || c_now == '/') {
+            showingAssistant = !showingAssistant;
+            if (showingAssistant) {
+              showAssistant();
+            } else {
+              showUser();
+            }
             markActivity();
-            scrollOffset--;
-            lcdShowAssistantReplyWindow();
-          }
-        } else if (c_now == '.') {
-          // scroll DOWN
-          if (scrollOffset < (int)replyLines.size() - 1) {
-            markActivity();
-            scrollOffset++;
-            lcdShowAssistantReplyWindow();
+          } else if (showingAssistant) {
+            if (c_now == ';') {
+              if (scrollOffset > 0) {
+                markActivity();
+                scrollOffset--;
+              lcdShowAssistantReplyWindow();
+            }
+          } else if (c_now == '.') {
+            if (scrollOffset < maxOffset) {
+              markActivity();
+              scrollOffset++;
+              lcdShowAssistantReplyWindow();
+            }
           }
         }
       }
@@ -1378,7 +1570,7 @@ String readPromptFromKeyboard() {
       }
       wakeDisplayIfNeeded();
       lcdShowPromptEditing(inputBuffer);
-      renderStatusLine(true);
+      renderStatusLineInner(true);
       markActivity();
     }
 
@@ -1601,11 +1793,11 @@ void setup() {
   M5Cardputer.begin();
   M5Cardputer.Display.setRotation(1);
   M5Cardputer.Display.setTextWrap(false);
-  M5Cardputer.Display.setTextSize(1);
+  M5Cardputer.Display.setTextSize(CONTENT_TEXT_SIZE);
   initializeLed();
 
   lcdClearAll();
-  lcdHeader("Cardputer AI Assistant");
+  lcdHeader("Cardputer AI");
   lcdStatusLine("Booting...");
   displaySleeping = false;
   lastActivityMs = millis();
@@ -1674,6 +1866,7 @@ void loop() {
 
   // 2. Add the user message to the rolling conversation
   addMessageToHistory("user", userMsg);
+  lastUserPrompt = userMsg;
 
   // Show frozen prompt while querying
   lcdShowPromptEditing(userMsg);
@@ -1705,4 +1898,52 @@ void loop() {
   // 8. Ready for next turn
   lcdStatusLine("Done. ENTER new prompt.");
   markActivity();
+}
+String marqueeTextForStatus() {
+  return statusBaseLine;
+}
+
+void renderStatusLineInner(bool force) {
+  if (displaySleeping) return;
+  unsigned long now = millis();
+  if (!force && (now - lastBatteryUpdateMs) < 100) {
+    return;
+  }
+
+  String text = marqueeTextForStatus();
+  M5Cardputer.Display.setTextSize(STATUS_TEXT_SIZE);
+  int textWidth = M5Cardputer.Display.textWidth(text.c_str());
+  int availableWidth = SCREEN_WIDTH - CONTENT_MARGIN_X * 2;
+  if (textWidth <= availableWidth) {
+    statusScrollOffset = 0;
+  } else {
+    const int scrollSpeed = 12;
+    if (!force && (now - lastStatusScrollUpdateMs) < 120) {
+      updateHeaderBattery();
+      return;
+    }
+    lastStatusScrollUpdateMs = now;
+    statusScrollOffset += scrollSpeed;
+    int maxOffset = textWidth + CONTENT_MARGIN_X;
+    if (statusScrollOffset > maxOffset) {
+      statusScrollOffset = 0;
+    }
+  }
+
+  M5Cardputer.Display.fillRect(0, HEADER_HEIGHT, SCREEN_WIDTH, STATUS_HEIGHT, BLACK);
+  M5Cardputer.Display.setCursor(CONTENT_MARGIN_X - statusScrollOffset, HEADER_HEIGHT + CONTENT_MARGIN_Y);
+  M5Cardputer.Display.setTextColor(YELLOW, BLACK);
+  M5Cardputer.Display.print(text);
+
+  if (textWidth > availableWidth) {
+    M5Cardputer.Display.setCursor(CONTENT_MARGIN_X - statusScrollOffset + textWidth + 16, HEADER_HEIGHT + CONTENT_MARGIN_Y);
+    M5Cardputer.Display.print(text);
+  }
+
+  lastBatteryUpdateMs = now;
+  updateHeaderBattery();
+}
+
+void renderStatusLine(bool force) {
+  renderStatusLineInner(force);
 }
