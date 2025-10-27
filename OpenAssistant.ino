@@ -88,6 +88,7 @@ String lastAssistantReply = "";
 File voiceTempFile;
 size_t voiceRecordedSamples = 0;
 bool voiceFileReady = false;
+bool voiceTranscribing = false;
 
 // ------------------------------------------------------------
 // Utility: trim whitespace from both ends of String
@@ -792,6 +793,14 @@ String readPromptFromKeyboard() {
 
     // Voice recording handling when GO button is held
     if (goNow && !prevGoButton && !voiceRecording) {
+      if (voiceTranscribing) {
+        lcdStatusLine("Voice busy... finishing prior clip");
+        prevGoButton = goNow;
+        prevBackspace = backspaceNow;
+        prevHeld = currHeld;
+        delay(30);
+        continue;
+      }
       voiceSampleCount = 0;
       voiceRecordedSamples = 0;
       voiceFileReady = false;
@@ -868,7 +877,9 @@ String readPromptFromKeyboard() {
 
         voiceFileReady = (!voiceWriteError && voiceRecordedSamples > 0 && SD.exists(VOICE_TEMP_PATH));
         if (voiceFileReady) {
+          voiceTranscribing = true;
           String transcript = transcribeVoiceFile(voiceRecordedSamples);
+          voiceTranscribing = false;
           if (transcript.length() > 0) {
             if (inputBuffer.length() > 0 && inputBuffer.charAt(inputBuffer.length() - 1) != ' ') {
               inputBuffer += ' ';
@@ -888,6 +899,7 @@ String readPromptFromKeyboard() {
         voiceTempFile = File();
         voiceFileReady = false;
         voiceRecordedSamples = 0;
+        voiceTranscribing = false;
       }
 
       prevGoButton = goNow;
