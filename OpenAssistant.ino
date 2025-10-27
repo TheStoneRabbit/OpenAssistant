@@ -31,6 +31,7 @@
 #include <vector>
 #include <cstring>
 #include <cstdio>
+#include <ctype.h>
 #include <SD.h>
 #include <SPI.h>
 #include "esp32-hal-rgb-led.h"
@@ -66,6 +67,8 @@ const char*    VOICE_TEMP_DIR        = "/oa_tmp";
 const char*    VOICE_TEMP_PATH       = "/oa_tmp/voice.raw";
 const char*    TRANSCRIPT_DIR        = "/transcripts";
 
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
+
 const uint32_t INACTIVITY_TIMEOUT_MS      = 60000;
 const uint32_t BATTERY_UPDATE_INTERVAL_MS = 5000;
 
@@ -87,7 +90,7 @@ int scrollOffset = 0;
 
 // Keep the last assistant reply so GO button can "type" it out
 String lastAssistantReply = "";
-String currentStatusLine = "";
+String statusBaseLine = "";
 
 // Voice recording state (SD-backed)
 File voiceTempFile;
@@ -350,11 +353,50 @@ String requestTranscriptionFromSD(size_t sampleCount) {
     size_t rd = audioFile.read(ioBuf, sizeof(ioBuf));
     if (rd == 0) break;
     httpsClient.write(ioBuf, rd);
+    maybeUpdateLed();
   }
   audioFile.close();
   httpsClient.print(closing);
 
-  String statusLine = httpsClient.readStringUntil('\n');
+  String statusLine = "";
+  String headerAccum = "";
+  bool headersFinished = false;
+  unsigned long lastRead = millis();
+  String response;
+
+  while (httpsClient.connected() || httpsClient.available()) {
+    while (httpsClient.available()) {
+      char c = httpsClient.read();
+      lastRead = millis();
+      if (!headersFinished) {
+        headerAccum += c;
+        if (c == '\n') {
+          if (statusLine.length() == 0) {
+            statusLine = headerAccum;
+          }
+          if (headerAccum == "\r\n") {
+            headersFinished = true;
+          }
+          headerAccum = "";
+        }
+      } else {
+        response += c;
+      }
+    }
+
+    if (headersFinished && !httpsClient.connected() && !httpsClient.available()) {
+      break;
+    }
+
+    maybeUpdateLed();
+    if (millis() - lastRead > 30000) {
+      Serial.println("Transcription read timeout");
+      break;
+    }
+    delay(10);
+  }
+  httpsClient.stop();
+
   int statusCode = 0;
   int spaceIdx = statusLine.indexOf(' ');
   if (spaceIdx > 0) {
@@ -363,17 +405,6 @@ String requestTranscriptionFromSD(size_t sampleCount) {
       statusCode = statusLine.substring(spaceIdx + 1, spaceIdx2).toInt();
     }
   }
-
-  while (httpsClient.connected()) {
-    String headerLine = httpsClient.readStringUntil('\n');
-    if (headerLine == "\r") break;
-  }
-
-  String response;
-  while (httpsClient.available()) {
-    response += (char)httpsClient.read();
-  }
-  httpsClient.stop();
 
   response.trim();
   Serial.println("---- Transcription Response ----");
@@ -476,33 +507,51 @@ void lcdClearAll() {
   M5Cardputer.Display.fillScreen(BLACK);
 }
 
-void lcdUpdateBatteryIndicator() {
-  if (displaySleeping) return;
-
+int getBatteryPercent() {
   int level = M5Cardputer.Power.getBatteryLevel();
-  String txt = "--%";
   if (level >= 0 && level <= 100) {
-    txt = String(level) + "%";
+    return level;
   }
 
-  int textWidth = txt.length() * 6; // text size 1 => ~6px per char
-  int startX = 320 - textWidth - 6;
-  if (startX < 140) startX = 140;
+  float voltage = M5Cardputer.Power.getBatteryVoltage();  // volts
+  if (voltage <= 0.1f) {
+    return -1;
+  }
 
-  M5Cardputer.Display.fillRect(startX, 0, 320 - startX, 14, BLUE);
-  M5Cardputer.Display.setCursor(startX + 2, 2);
-  M5Cardputer.Display.setTextColor(WHITE, BLUE);
+  const float minV = 3.3f;
+  const float maxV = 4.2f;
+  float pct = (voltage - minV) * 100.0f / (maxV - minV);
+  return (int)constrain((int)(pct + 0.5f), 0, 100);
+}
+
+String composeStatusDisplay() {
+  String display = statusBaseLine;
+  int level = getBatteryPercent();
+  String battery = (level >= 0 && level <= 100) ? String(level) + "%" : "--%";
+  if (display.length() > 0) {
+    display += " ";
+  }
+  display += "[" + battery + "]";
+  return display;
+}
+
+void renderStatusLine(bool force = false) {
+  if (displaySleeping) return;
+  unsigned long now = millis();
+  if (!force && (now - lastBatteryUpdateMs) < BATTERY_UPDATE_INTERVAL_MS) {
+    return;
+  }
+  String full = composeStatusDisplay();
+  M5Cardputer.Display.fillRect(0, 16, 320, 12, BLACK);
+  M5Cardputer.Display.setCursor(0, 16);
+  M5Cardputer.Display.setTextColor(YELLOW, BLACK);
   M5Cardputer.Display.setTextSize(1);
-  M5Cardputer.Display.print(txt);
-  lastBatteryUpdateMs = millis();
+  M5Cardputer.Display.print(full);
+  lastBatteryUpdateMs = now;
 }
 
 void maybeUpdateBatteryIndicator() {
-  if (displaySleeping) return;
-  unsigned long now = millis();
-  if (now - lastBatteryUpdateMs >= BATTERY_UPDATE_INTERVAL_MS) {
-    lcdUpdateBatteryIndicator();
-  }
+  renderStatusLine(false);
 }
 
 void markActivity() {
@@ -516,9 +565,7 @@ bool wakeDisplayIfNeeded() {
   M5Cardputer.Display.setBrightness(255);
   lcdClearAll();
   lcdHeader("Cardputer AI Assistant");
-  if (!currentStatusLine.isEmpty()) {
-    lcdStatusLine(currentStatusLine);
-  }
+  renderStatusLine(true);
   return true;
 }
 
@@ -591,6 +638,157 @@ void maybeUpdateLed() {
   }
 }
 
+bool stringIsDigits(const String& s) {
+  if (s.length() == 0) return false;
+  for (size_t i = 0; i < s.length(); ++i) {
+    char c = s[i];
+    if (!isdigit(static_cast<unsigned char>(c))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+template <typename KeyState>
+bool hasKeyboardActivity(const KeyState& ks) {
+  return ks.enter || ks.del || !ks.word.empty();
+}
+
+String readSimpleTextLine(const String& statusMsg) {
+  String buffer = "";
+  std::vector<char> prevHeld;
+  bool prevBackspace = false;
+
+  markActivity();
+  lcdShowPromptEditing(buffer);
+  lcdStatusLine(statusMsg);
+
+  while (true) {
+    M5Cardputer.update();
+    maybeUpdateLed();
+    maybeUpdateBatteryIndicator();
+    checkDisplaySleep();
+
+    auto ks = M5Cardputer.Keyboard.keysState();
+    bool goNow = M5Cardputer.BtnA.isPressed();
+    bool inputActive = hasKeyboardActivity(ks) || goNow;
+    if (displaySleeping) {
+      if (!inputActive) {
+        prevHeld = ks.word;
+        prevBackspace = ks.del;
+        delay(40);
+        continue;
+      }
+      wakeDisplayIfNeeded();
+      lcdShowPromptEditing(buffer);
+      lcdStatusLine(statusMsg);
+      markActivity();
+    }
+
+    bool backspaceNow = ks.del;
+    if (backspaceNow && !prevBackspace) {
+      if (buffer.length() > 0) {
+        buffer.remove(buffer.length() - 1);
+        markActivity();
+      }
+    }
+    prevBackspace = backspaceNow;
+
+    std::vector<char> currHeld = ks.word;
+    for (char c_now : currHeld) {
+      bool alreadyHeld = false;
+      for (char c_prev : prevHeld) {
+        if (c_prev == c_now) {
+          alreadyHeld = true;
+          break;
+        }
+      }
+      if (alreadyHeld) continue;
+
+      uint8_t code = static_cast<uint8_t>(c_now);
+      if (code == 0x7F || code == 0x2A) {
+        if (buffer.length() > 0) {
+          buffer.remove(buffer.length() - 1);
+          markActivity();
+        }
+      } else if (code == '\n') {
+        String result = buffer;
+        result.trim();
+        return result;
+      } else if (code >= 0x20 && code <= 0x7E) {
+        buffer += static_cast<char>(code);
+        markActivity();
+      }
+    }
+
+    if (ks.enter) {
+      String result = buffer;
+      result.trim();
+      markActivity();
+      return result;
+    }
+
+    lcdShowPromptEditing(buffer);
+    lcdStatusLine(statusMsg);
+
+    prevHeld = currHeld;
+    delay(30);
+  }
+}
+
+bool connectToWiFi(const String& ssid, const String& pass, unsigned long timeoutMs = WIFI_CONNECT_TIMEOUT_MS) {
+  if (ssid.isEmpty()) return false;
+
+  ledEnterBusy();
+  markActivity();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true, true);
+  delay(120);
+
+  if (pass.length() > 0) {
+    WiFi.begin(ssid.c_str(), pass.c_str());
+  } else {
+    WiFi.begin(ssid.c_str());
+  }
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
+    maybeUpdateLed();
+    delay(250);
+  }
+
+  bool ok = (WiFi.status() == WL_CONNECTED);
+  if (ok) {
+    WiFi.setAutoReconnect(true);
+  } else {
+    WiFi.disconnect(true);
+  }
+
+  ledExitBusy();
+  return ok;
+}
+
+bool writeConfigToSD() {
+  if (!mountSD()) return false;
+  SD.remove("/chat_config.txt");
+  File f = SD.open("/chat_config.txt", FILE_WRITE);
+  if (!f) {
+    unmountSD();
+    return false;
+  }
+
+  f.print("WIFI_SSID = ");
+  f.println(WIFI_SSID);
+  f.print("WIFI_PASS = ");
+  f.println(WIFI_PASS);
+  f.print("OPENAI_KEY = ");
+  f.println(OPENAI_API_KEY);
+  f.close();
+  unmountSD();
+  return true;
+}
+
 void lcdHeader(const String& msg) {
   // Top bar (0..14 px tall)
   M5Cardputer.Display.fillRect(0, 0, 320, 14, BLUE);
@@ -598,18 +796,11 @@ void lcdHeader(const String& msg) {
   M5Cardputer.Display.setTextColor(WHITE, BLUE);
   M5Cardputer.Display.setTextSize(1);
   M5Cardputer.Display.print(msg);
-  lcdUpdateBatteryIndicator();
 }
 
 void lcdStatusLine(const String& msg) {
-  currentStatusLine = msg;
-  if (displaySleeping) return;
-  // Status bar under header at y=16
-  M5Cardputer.Display.fillRect(0, 16, 320, 12, BLACK);
-  M5Cardputer.Display.setCursor(0, 16);
-  M5Cardputer.Display.setTextColor(YELLOW, BLACK);
-  M5Cardputer.Display.setTextSize(1);
-  M5Cardputer.Display.print(msg);
+  statusBaseLine = msg;
+  renderStatusLine(true);
 }
 
 void lcdShowPromptEditing(const String& current) {
@@ -686,22 +877,175 @@ void lcdShowAssistantReplyWindow() {
 // ------------------------------------------------------------
 
 void connectWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID.c_str(), WIFI_PASS.c_str());
+  if (WIFI_SSID.isEmpty()) {
+    lcdStatusLine("WiFi config missing. Use /wifi");
+    Serial.println("WiFi config missing.");
+    return;
+  }
 
   lcdStatusLine("WiFi: connecting...");
   Serial.print("Connecting to WiFi: ");
   Serial.println(WIFI_SSID);
 
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(300);
+  bool ok = connectToWiFi(WIFI_SSID, WIFI_PASS, WIFI_CONNECT_TIMEOUT_MS);
+
+  if (ok) {
+    Serial.println("WiFi connected!");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+    lcdStatusLine("WiFi OK: " + WiFi.localIP().toString());
+  } else {
+    Serial.println("WiFi connection failed.");
+    lcdStatusLine("WiFi failed. Use /wifi to set up");
+  }
+}
+
+bool wifiInteractiveSetup() {
+  lcdClearAll();
+  lcdHeader("WiFi Setup");
+  lcdStatusLine("Scanning networks...");
+  markActivity();
+
+  ledEnterBusy();
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true, true);
+  delay(120);
+  int networkCount = WiFi.scanNetworks();
+  ledExitBusy();
+
+  if (networkCount <= 0) {
+    lcdStatusLine("No networks found.");
+    Serial.println("WiFi scan returned no networks.");
+    delay(1200);
+    WiFi.scanDelete();
+    return false;
   }
 
-  Serial.println("WiFi connected!");
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
+  lcdClearAll();
+  lcdHeader("WiFi Networks");
+  M5Cardputer.Display.setCursor(0, 32);
+  int maxDisplay = networkCount < 10 ? networkCount : 10;
+  for (int i = 0; i < maxDisplay; ++i) {
+    String line = String(i) + ": " + WiFi.SSID(i);
+    if (WiFi.encryptionType(i) != WIFI_AUTH_OPEN) {
+      line += " *";
+    }
+    if (line.length() > 28) {
+      line = line.substring(0, 28);
+    }
+    M5Cardputer.Display.println(line);
+  }
+  if (networkCount > maxDisplay) {
+    M5Cardputer.Display.println("... (" + String(networkCount - maxDisplay) + " more)");
+  }
 
-  lcdStatusLine("WiFi OK: " + WiFi.localIP().toString());
+  String selection = readSimpleTextLine("Select network # or name (blank=cancel)");
+  selection.trim();
+  if (selection.length() == 0 || selection.equalsIgnoreCase("exit")) {
+    lcdStatusLine("WiFi setup cancelled.");
+    delay(900);
+    WiFi.scanDelete();
+    return false;
+  }
+
+  String chosenSsid = "";
+  String chosenPass = "";
+  bool requiresPass = true;
+  int chosenIndex = -1;
+
+  bool selectionIsNumber = stringIsDigits(selection);
+  if (selectionIsNumber) {
+    int idx = selection.toInt();
+    if (idx >= 0 && idx < networkCount) {
+      chosenIndex = idx;
+      chosenSsid = WiFi.SSID(idx);
+      wifi_auth_mode_t auth = (wifi_auth_mode_t)WiFi.encryptionType(idx);
+      requiresPass = (auth != WIFI_AUTH_OPEN);
+    } else {
+      lcdStatusLine("Invalid selection.");
+      delay(900);
+      WiFi.scanDelete();
+      return false;
+    }
+  }
+
+  if (!selectionIsNumber) {
+    chosenSsid = selection;
+    requiresPass = true;
+  }
+
+  WiFi.scanDelete();
+
+  if (chosenSsid.isEmpty()) {
+    lcdStatusLine("Invalid selection.");
+    delay(900);
+    return false;
+  }
+
+  if (requiresPass) {
+    bool haveExisting = (chosenSsid == WIFI_SSID) && !WIFI_PASS.isEmpty();
+    while (true) {
+      String prompt = haveExisting
+        ? "Password (blank=keep current /cancel)"
+        : "Enter WiFi password (/cancel)";
+      String entry = readSimpleTextLine(prompt);
+      if (entry.equalsIgnoreCase("/cancel")) {
+        lcdStatusLine("WiFi setup cancelled.");
+        delay(900);
+        return false;
+      }
+      if (entry.length() == 0) {
+        if (haveExisting) {
+          chosenPass = WIFI_PASS;
+          break;
+        } else {
+          lcdStatusLine("Password required.");
+          delay(800);
+          continue;
+        }
+      }
+      chosenPass = entry;
+      break;
+    }
+  } else {
+    lcdStatusLine("Open network selected.");
+    delay(500);
+  }
+
+  lcdStatusLine("Connecting to " + chosenSsid);
+  bool ok = connectToWiFi(chosenSsid, chosenPass, WIFI_CONNECT_TIMEOUT_MS);
+  if (!ok) {
+    lcdStatusLine("WiFi connect failed.");
+    Serial.println("Interactive WiFi connect failed.");
+    delay(1200);
+    return false;
+  }
+
+  WIFI_SSID = chosenSsid;
+  WIFI_PASS = chosenPass;
+
+  lcdStatusLine("WiFi connected!");
+  Serial.println("Interactive WiFi setup succeeded.");
+  delay(800);
+
+  String saveAnswer = readSimpleTextLine("Save network to SD? (y/n)");
+  saveAnswer.trim();
+  saveAnswer.toLowerCase();
+  if (saveAnswer.startsWith("y")) {
+    bool saved = writeConfigToSD();
+    if (saved) {
+      lcdStatusLine("Config saved.");
+      Serial.println("WiFi configuration saved to SD.");
+    } else {
+      lcdStatusLine("Failed to save config.");
+      Serial.println("Failed to save WiFi config to SD.");
+    }
+    delay(900);
+  }
+
+  lcdStatusLine("WiFi ready.");
+  delay(600);
+  return true;
 }
 
 void initHTTPS() {
@@ -774,18 +1118,48 @@ String callOpenAI() {
 
     httpsClient.print(req);
 
-    while (httpsClient.connected()) {
-      String line = httpsClient.readStringUntil('\n');
-      maybeUpdateLed();
-      if (line == "\r") break;
-    }
+    String statusLine = "";
+    String headerAccum = "";
+    bool headersFinished = false;
+    unsigned long lastRead = millis();
 
-    while (httpsClient.available()) {
-      response += (char)httpsClient.read();
+    while (httpsClient.connected() || httpsClient.available()) {
+      while (httpsClient.available()) {
+        char c = httpsClient.read();
+        lastRead = millis();
+        if (!headersFinished) {
+          headerAccum += c;
+          if (c == '\n') {
+            if (statusLine.length() == 0) {
+              statusLine = headerAccum;
+            }
+            if (headerAccum == "\r\n") {
+              headersFinished = true;
+            }
+            headerAccum = "";
+          }
+        } else {
+          response += c;
+        }
+      }
+
+      if (headersFinished && !httpsClient.connected() && !httpsClient.available()) {
+        break;
+      }
+
       maybeUpdateLed();
+      if (millis() - lastRead > 30000) {
+        Serial.println("OpenAI read timeout");
+        break;
+      }
+      delay(10);
     }
 
     httpsClient.stop();
+    if (statusLine.length()) {
+      Serial.print("HTTP status: ");
+      Serial.print(statusLine);
+    }
   } else {
     Serial.println("HTTPS connect FAIL");
     lcdStatusLine("OpenAI connect FAIL");
@@ -873,13 +1247,22 @@ void viewAssistantReplyInteractive() {
     maybeUpdateLed();
     maybeUpdateBatteryIndicator();
     checkDisplaySleep();
-    bool woke = wakeDisplayIfNeeded();
-    if (woke) {
+    auto ks = M5Cardputer.Keyboard.keysState();
+    bool goNow = M5Cardputer.BtnA.isPressed();
+    bool inputActive = hasKeyboardActivity(ks) || goNow;
+    if (displaySleeping) {
+      if (!inputActive) {
+        prevHeld = ks.word;
+        prevEnter = ks.enter;
+        prevGo = goNow;
+        delay(60);
+        continue;
+      }
+      wakeDisplayIfNeeded();
       lcdShowAssistantReplyWindow();
       lcdStatusLine(";/.:scroll GO:type ENTER:exit");
+      markActivity();
     }
-
-    auto ks = M5Cardputer.Keyboard.keysState();
 
     // -- EXIT on ENTER --
     if (ks.enter && !prevEnter) {
@@ -889,7 +1272,6 @@ void viewAssistantReplyInteractive() {
     prevEnter = ks.enter;
 
     // -- GO button to type the last assistant reply --
-    bool goNow = M5Cardputer.BtnA.isPressed();
     if (goNow && !prevGo) {
       markActivity();
       // Send keystrokes over USB
@@ -980,18 +1362,25 @@ String readPromptFromKeyboard() {
     maybeUpdateLed();
     maybeUpdateBatteryIndicator();
     checkDisplaySleep();
-    bool woke = wakeDisplayIfNeeded();
-    if (woke) {
-      lcdShowPromptEditing(inputBuffer);
-      if (!currentStatusLine.isEmpty()) {
-        lcdStatusLine(currentStatusLine);
-      }
-    }
-
     auto ks = M5Cardputer.Keyboard.keysState();
     bool goNow = M5Cardputer.BtnA.isPressed();
     bool backspaceNow = ks.del;
     std::vector<char> currHeld = ks.word;
+
+    bool inputActive = hasKeyboardActivity(ks) || goNow;
+    if (displaySleeping) {
+      if (!inputActive) {
+        prevHeld = currHeld;
+        prevGoButton = goNow;
+        prevBackspace = backspaceNow;
+        delay(50);
+        continue;
+      }
+      wakeDisplayIfNeeded();
+      lcdShowPromptEditing(inputBuffer);
+      renderStatusLine(true);
+      markActivity();
+    }
 
     // Voice recording handling when GO button is held
     if (goNow && !prevGoButton && !voiceRecording) {
@@ -1083,6 +1472,7 @@ String readPromptFromKeyboard() {
         }
 
         while (M5Cardputer.Mic.isRecording()) {
+          maybeUpdateLed();
           delay(5);
         }
         M5Cardputer.Mic.end();
@@ -1092,7 +1482,8 @@ String readPromptFromKeyboard() {
           voiceTempFile = File();
         }
 
-        voiceFileReady = (!voiceWriteError && voiceRecordedSamples > 0 && SD.exists(VOICE_TEMP_PATH));
+        bool voiceFilePresent = sdMounted && SD.exists(VOICE_TEMP_PATH);
+        voiceFileReady = (!voiceWriteError && voiceRecordedSamples > 0 && voiceFilePresent);
         if (voiceFileReady) {
           voiceTranscribing = true;
           String transcript = transcribeVoiceFile(voiceRecordedSamples);
@@ -1211,6 +1602,7 @@ void setup() {
   M5Cardputer.Display.setRotation(1);
   M5Cardputer.Display.setTextWrap(false);
   M5Cardputer.Display.setTextSize(1);
+  initializeLed();
 
   lcdClearAll();
   lcdHeader("Cardputer AI Assistant");
@@ -1271,6 +1663,12 @@ void loop() {
     }
     markActivity();
     delay(900);
+    return;
+  }
+  if (userMsg.equalsIgnoreCase("/wifi")) {
+    bool result = wifiInteractiveSetup();
+    markActivity();
+    delay(600);
     return;
   }
 

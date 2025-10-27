@@ -8,7 +8,9 @@ This sketch turns an M5Stack Cardputer (ESP32-S3) into a handheld ChatGPT client
 - Displays replies in a scrollable UI and can “type” the last answer into a connected host via USB keyboard emulation.
 - Optional voice input: hold the `GO` button while editing to record audio, transcribe it with OpenAI (`gpt-4o-mini-transcribe`), and append the text into your prompt.
 - `/context` command saves the current conversation to `transcripts/` on the SD card and starts a fresh session.
-- Live battery percentage in the header plus automatic screen sleep/wake after 1 minute of inactivity.
+- `/wifi` command scans for nearby networks and lets you connect/update the stored credentials if the SD config fails.
+- Live battery percentage in the status bar plus automatic screen sleep/wake after 1 minute of inactivity.
+- On-board status LED: steady green when idle, flashing blue while recording/transcribing or querying OpenAI.
 
 ## Hardware & Software Requirements
 - M5Stack Cardputer (ESP32-S3) with TinyUSB HID support enabled.
@@ -40,14 +42,16 @@ Lines starting with `#` are treated as comments. The file is read during boot; m
    - Recording status shows elapsed seconds.
    - Audio is streamed to `/oa_tmp/voice.raw` on the SD card; if the card fills or a write fails you’ll see `Voice write failed`.
    - When recording stops, the sketch uploads the audio to OpenAI, receives the transcript, and appends it to the prompt. You can edit further before submitting.
-4. Type `/context` (and press `ENTER`) any time you want to archive the current conversation:
+4. Type `/wifi` to scan for nearby networks and pick one directly from the device when the SD config isn’t working.
+5. Type `/context` (and press `ENTER`) any time you want to archive the current conversation:
    - The whole chat history, including the system prompt, is written to `transcripts/context_<timestamp>.txt`.
    - A fresh conversation context is started automatically.
-5. After the assistant replies:
+6. After the assistant replies:
    - `;` scrolls up, `.` scrolls down.
    - `GO` types the full reply into the host computer via USB HID.
    - `ENTER` exits view mode and returns to prompt editing.
-6. If you leave the device idle for ~1 minute the display sleeps to save power; press any key or button to wake it up (the UI restores automatically).
+7. If you leave the device idle for ~1 minute the display sleeps to save power; press any key or button to wake it up (the UI restores automatically).
+8. Watch the front RGB LED: solid green means idle, flashing blue means the device is busy (voice capture/transcription or OpenAI request).
 
 ## Troubleshooting
 - **Wi-Fi stuck on “connecting”**: double-check SSID/password and that the SD card was detected.
