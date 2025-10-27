@@ -1,0 +1,11 @@
+# Build artifacts
+build/
+
+# macOS metadata
+.DS_Store
+
+# Arduino backup files
+*.ino.bak
+*.cpp.bak
+*.h.bak
+
