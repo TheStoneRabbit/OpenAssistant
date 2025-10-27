@@ -30,6 +30,7 @@
 #include <M5Cardputer.h>
 #include <vector>
 #include <cstring>
+#include <cstdio>
 #include <SD.h>
 #include <SPI.h>
 
@@ -49,15 +50,20 @@ const char* OPENAI_HOST     = "api.openai.com";
 const int   OPENAI_PORT     = 443;
 const char* OPENAI_ENDPOINT = "/v1/responses";
 const char* OPENAI_TRANSCRIBE_ENDPOINT = "/v1/audio/transcriptions";
-const char* MODEL_NAME      = "gpt-4o-mini";
+const char* MODEL_NAME       = "gpt-4o-mini";
 const char* TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe";
+const char* SYSTEM_PROMPT_TEXT =
+  "You are a helpful assistant on a tiny handheld called the Cardputer. "
+  "Keep answers short, clear, and friendly so they fit on the 320x240 screen.";
 
 // Voice recording configuration
 const uint32_t VOICE_SAMPLE_RATE     = 16000;
 const size_t   VOICE_CHUNK_SAMPLES   = 256;
 const uint32_t VOICE_MAX_DURATION_MS = 6000;
 const size_t   VOICE_MAX_SAMPLES     = (VOICE_MAX_DURATION_MS / 1000) * VOICE_SAMPLE_RATE;
-const char*    VOICE_TEMP_PATH       = "/voice_tmp.raw";
+const char*    VOICE_TEMP_DIR        = "/oa_tmp";
+const char*    VOICE_TEMP_PATH       = "/oa_tmp/voice.raw";
+const char*    TRANSCRIPT_DIR        = "/transcripts";
 
 // ---------- GLOBALS ----------
 
@@ -166,6 +172,61 @@ bool appendSamplesToVoiceFile(const int16_t* samples, size_t sampleCount) {
 
   voiceTempFile.flush();
   return true;
+}
+
+String generateTranscriptPath() {
+  unsigned long stamp = millis();
+  char name[64];
+  snprintf(name, sizeof(name), "%s/context_%lu.txt", TRANSCRIPT_DIR, (unsigned long)stamp);
+  return String(name);
+}
+
+bool ensureDirectory(const char* path) {
+  if (SD.exists(path)) {
+    return true;
+  }
+  return SD.mkdir(path);
+}
+
+bool saveContextTranscript(String& outPath) {
+  if (!ensureDirectory(TRANSCRIPT_DIR)) {
+    Serial.println("Failed to ensure transcript dir.");
+    return false;
+  }
+
+  String filePath = generateTranscriptPath();
+  File f = SD.open(filePath, FILE_WRITE);
+  if (!f) {
+    Serial.println("Failed to open transcript file.");
+    return false;
+  }
+
+  unsigned long stamp = millis();
+  f.print("# Cardputer transcript @ ");
+  f.println(stamp);
+  f.println("# Format: role: content");
+  f.println();
+
+  for (size_t i = 0; i < chatHistory.size(); ++i) {
+    f.print(chatHistory[i].role);
+    f.println(":");
+    f.println(chatHistory[i].content);
+    f.println();
+  }
+  f.close();
+
+  outPath = filePath;
+  Serial.print("Transcript saved to: ");
+  Serial.println(filePath);
+  return true;
+}
+
+void resetConversationState() {
+  chatHistory.clear();
+  addMessageToHistory("system", SYSTEM_PROMPT_TEXT);
+  lastAssistantReply = "";
+  replyLines.clear();
+  scrollOffset = 0;
 }
 
 String requestTranscriptionFromSD(size_t sampleCount) {
@@ -745,6 +806,7 @@ String readPromptFromKeyboard() {
         voiceTempFile.close();
         voiceTempFile = File();
       }
+      ensureDirectory(VOICE_TEMP_DIR);
       SD.remove(VOICE_TEMP_PATH);
       voiceTempFile = SD.open(VOICE_TEMP_PATH, FILE_WRITE);
       if (!voiceTempFile) {
@@ -926,17 +988,15 @@ void setup() {
     Serial.println("No valid config on SD!");
     delay(2000);
   }
+  ensureDirectory(VOICE_TEMP_DIR);
+  ensureDirectory(TRANSCRIPT_DIR);
 
   // connect WiFi + HTTPS
   connectWiFi();
   initHTTPS();
 
   // seed system message so model knows how to behave
-  addMessageToHistory(
-    "system",
-    "You are a helpful assistant on a tiny handheld called the Cardputer. "
-    "Keep answers short, clear, and friendly so they fit on the 320x240 screen."
-  );
+  resetConversationState();
 
   lcdStatusLine("Ready. Type prompt.");
 }
@@ -946,6 +1006,24 @@ void loop() {
   String userMsg = readPromptFromKeyboard();
   if (userMsg.isEmpty()) {
     lcdStatusLine("Empty. Type again.");
+    return;
+  }
+  if (userMsg.equalsIgnoreCase("/context")) {
+    String savedPath;
+    bool saved = saveContextTranscript(savedPath);
+    if (saved) {
+      resetConversationState();
+      lcdShowPromptEditing("");
+      String basename = savedPath;
+      int slash = basename.lastIndexOf('/');
+      if (slash >= 0 && slash < (int)basename.length() - 1) {
+        basename = basename.substring(slash + 1);
+      }
+      lcdStatusLine("Context saved: " + basename);
+    } else {
+      lcdStatusLine("Context save failed.");
+    }
+    delay(900);
     return;
   }
 
