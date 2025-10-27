@@ -33,6 +33,7 @@
 #include <cstdio>
 #include <SD.h>
 #include <SPI.h>
+#include "esp32-hal-rgb-led.h"
 
 // ---- USB HID keyboard (TinyUSB style on ESP32-S3) ----
 #include "USB.h"
@@ -65,6 +66,9 @@ const char*    VOICE_TEMP_DIR        = "/oa_tmp";
 const char*    VOICE_TEMP_PATH       = "/oa_tmp/voice.raw";
 const char*    TRANSCRIPT_DIR        = "/transcripts";
 
+const uint32_t INACTIVITY_TIMEOUT_MS      = 60000;
+const uint32_t BATTERY_UPDATE_INTERVAL_MS = 5000;
+
 // ---------- GLOBALS ----------
 
 WiFiClientSecure httpsClient;
@@ -83,12 +87,24 @@ int scrollOffset = 0;
 
 // Keep the last assistant reply so GO button can "type" it out
 String lastAssistantReply = "";
+String currentStatusLine = "";
 
 // Voice recording state (SD-backed)
 File voiceTempFile;
 size_t voiceRecordedSamples = 0;
 bool voiceFileReady = false;
 bool voiceTranscribing = false;
+bool displaySleeping = false;
+unsigned long lastActivityMs = 0;
+unsigned long lastBatteryUpdateMs = 0;
+bool sdMounted = false;
+
+// LED state
+int8_t boardLedPin = -1;
+bool ledAvailable = false;
+bool ledBlinkState = false;
+unsigned long lastLedToggleMs = 0;
+int ledBusyDepth = 0;
 
 // ------------------------------------------------------------
 // Utility: trim whitespace from both ends of String
@@ -189,9 +205,35 @@ bool ensureDirectory(const char* path) {
   return SD.mkdir(path);
 }
 
+bool mountSD() {
+  if (sdMounted) return true;
+  if (!SD.begin()) {
+    Serial.println("SD mount failed.");
+    return false;
+  }
+  sdMounted = true;
+  return true;
+}
+
+void unmountSD() {
+  if (!sdMounted) return;
+  if (voiceTempFile) {
+    voiceTempFile.flush();
+    voiceTempFile.close();
+    voiceTempFile = File();
+  }
+  SD.end();
+  sdMounted = false;
+}
+
 bool saveContextTranscript(String& outPath) {
+  if (!mountSD()) {
+    Serial.println("Failed to mount SD for transcript.");
+    return false;
+  }
   if (!ensureDirectory(TRANSCRIPT_DIR)) {
     Serial.println("Failed to ensure transcript dir.");
+    unmountSD();
     return false;
   }
 
@@ -199,6 +241,7 @@ bool saveContextTranscript(String& outPath) {
   File f = SD.open(filePath, FILE_WRITE);
   if (!f) {
     Serial.println("Failed to open transcript file.");
+    unmountSD();
     return false;
   }
 
@@ -215,6 +258,7 @@ bool saveContextTranscript(String& outPath) {
     f.println();
   }
   f.close();
+  unmountSD();
 
   outPath = filePath;
   Serial.print("Transcript saved to: ");
@@ -344,6 +388,10 @@ String requestTranscriptionFromSD(size_t sampleCount) {
 }
 
 String transcribeVoiceFile(size_t sampleCount) {
+  if (!sdMounted) {
+    Serial.println("SD not mounted for transcription.");
+    return "";
+  }
   return requestTranscriptionFromSD(sampleCount);
 }
 
@@ -351,7 +399,7 @@ String transcribeVoiceFile(size_t sampleCount) {
 // Load config from SD card (/chat_config.txt)
 // ------------------------------------------------------------
 bool loadConfigFromSD() {
-  if (!SD.begin()) {
+  if (!mountSD()) {
     Serial.println("SD init FAILED");
     return false;
   }
@@ -359,6 +407,7 @@ bool loadConfigFromSD() {
   File f = SD.open("/chat_config.txt", "r");
   if (!f) {
     Serial.println("chat_config.txt MISSING");
+    unmountSD();
     return false;
   }
 
@@ -395,6 +444,7 @@ bool loadConfigFromSD() {
   }
 
   f.close();
+  unmountSD();
 
   if (WIFI_SSID.isEmpty() || WIFI_PASS.isEmpty() || OPENAI_API_KEY.isEmpty()) {
     Serial.println("Config missing one or more fields!");
@@ -426,6 +476,121 @@ void lcdClearAll() {
   M5Cardputer.Display.fillScreen(BLACK);
 }
 
+void lcdUpdateBatteryIndicator() {
+  if (displaySleeping) return;
+
+  int level = M5Cardputer.Power.getBatteryLevel();
+  String txt = "--%";
+  if (level >= 0 && level <= 100) {
+    txt = String(level) + "%";
+  }
+
+  int textWidth = txt.length() * 6; // text size 1 => ~6px per char
+  int startX = 320 - textWidth - 6;
+  if (startX < 140) startX = 140;
+
+  M5Cardputer.Display.fillRect(startX, 0, 320 - startX, 14, BLUE);
+  M5Cardputer.Display.setCursor(startX + 2, 2);
+  M5Cardputer.Display.setTextColor(WHITE, BLUE);
+  M5Cardputer.Display.setTextSize(1);
+  M5Cardputer.Display.print(txt);
+  lastBatteryUpdateMs = millis();
+}
+
+void maybeUpdateBatteryIndicator() {
+  if (displaySleeping) return;
+  unsigned long now = millis();
+  if (now - lastBatteryUpdateMs >= BATTERY_UPDATE_INTERVAL_MS) {
+    lcdUpdateBatteryIndicator();
+  }
+}
+
+void markActivity() {
+  lastActivityMs = millis();
+}
+
+bool wakeDisplayIfNeeded() {
+  if (!displaySleeping) return false;
+  displaySleeping = false;
+  M5Cardputer.Display.wakeup();
+  M5Cardputer.Display.setBrightness(255);
+  lcdClearAll();
+  lcdHeader("Cardputer AI Assistant");
+  if (!currentStatusLine.isEmpty()) {
+    lcdStatusLine(currentStatusLine);
+  }
+  return true;
+}
+
+void checkDisplaySleep() {
+  if (displaySleeping) return;
+  unsigned long now = millis();
+  if (now - lastActivityMs >= INACTIVITY_TIMEOUT_MS) {
+    displaySleeping = true;
+    M5Cardputer.Display.sleep();
+  }
+}
+
+void setLedColor(uint8_t r, uint8_t g, uint8_t b) {
+  if (!ledAvailable) return;
+  rgbLedWrite(boardLedPin, r, g, b);
+}
+
+void initializeLed() {
+  boardLedPin = M5.getPin(m5::pin_name_t::rgb_led);
+  ledAvailable = (boardLedPin >= 0 && boardLedPin < 255);
+  ledBlinkState = false;
+  lastLedToggleMs = millis();
+  ledBusyDepth = 0;
+  if (ledAvailable) {
+    setLedColor(0, 255, 0);
+    ledBlinkState = true;
+  }
+}
+
+void ledEnterBusy() {
+  if (!ledAvailable) return;
+  ledBusyDepth++;
+  setLedColor(0, 0, 255);
+  ledBlinkState = true;
+  lastLedToggleMs = millis();
+}
+
+void ledExitBusy() {
+  if (!ledAvailable) return;
+  if (ledBusyDepth > 0) {
+    ledBusyDepth--;
+  }
+  if (ledBusyDepth == 0) {
+    ledBlinkState = false;
+    lastLedToggleMs = millis();
+    setLedColor(0, 255, 0);
+    ledBlinkState = true;
+  }
+}
+
+void maybeUpdateLed() {
+  if (!ledAvailable) return;
+  unsigned long now = millis();
+  if (ledBusyDepth > 0) {
+    if (now - lastLedToggleMs >= 300) {
+      ledBlinkState = !ledBlinkState;
+      lastLedToggleMs = now;
+      if (ledBlinkState) {
+        setLedColor(0, 0, 255);
+      } else {
+        setLedColor(0, 0, 0);
+      }
+    }
+  } else {
+    if (!ledBlinkState) {
+      setLedColor(0, 255, 0);
+      ledBlinkState = true;
+      lastLedToggleMs = now;
+    }
+  }
+}
+
 void lcdHeader(const String& msg) {
   // Top bar (0..14 px tall)
   M5Cardputer.Display.fillRect(0, 0, 320, 14, BLUE);
@@ -433,9 +598,12 @@ void lcdHeader(const String& msg) {
   M5Cardputer.Display.setTextColor(WHITE, BLUE);
   M5Cardputer.Display.setTextSize(1);
   M5Cardputer.Display.print(msg);
+  lcdUpdateBatteryIndicator();
 }
 
 void lcdStatusLine(const String& msg) {
+  currentStatusLine = msg;
+  if (displaySleeping) return;
   // Status bar under header at y=16
   M5Cardputer.Display.fillRect(0, 16, 320, 12, BLACK);
   M5Cardputer.Display.setCursor(0, 16);
@@ -570,63 +738,64 @@ String buildRequestBody() {
 // Send POST to OpenAI over HTTPS and capture the raw JSON reply
 // ------------------------------------------------------------
 String callOpenAI() {
+  ledEnterBusy();
   String body = buildRequestBody();
 
   lcdStatusLine("Querying OpenAI...");
+  markActivity();
   Serial.println("Connecting to OpenAI...");
   Serial.println("---- Request Body ----");
   Serial.println(body);
   Serial.println("----------------------");
 
-  // Important: fresh connection each request
+  String response = "";
+
   httpsClient.stop();
-  httpsClient.setInsecure(); // still insecure in dev, no root CA
+  httpsClient.setInsecure();
   httpsClient.setTimeout(15000);
 
-  if (!httpsClient.connect(OPENAI_HOST, OPENAI_PORT)) {
+  if (httpsClient.connect(OPENAI_HOST, OPENAI_PORT)) {
+    String req;
+    req += "POST ";
+    req += OPENAI_ENDPOINT;
+    req += " HTTP/1.1\r\n";
+    req += "Host: ";
+    req += OPENAI_HOST;
+    req += "\r\n";
+    req += "Authorization: Bearer ";
+    req += OPENAI_API_KEY;
+    req += "\r\n";
+    req += "Content-Type: application/json\r\n";
+    req += "Connection: close\r\n";
+    req += "Content-Length: ";
+    req += String(body.length());
+    req += "\r\n\r\n";
+    req += body;
+
+    httpsClient.print(req);
+
+    while (httpsClient.connected()) {
+      String line = httpsClient.readStringUntil('\n');
+      maybeUpdateLed();
+      if (line == "\r") break;
+    }
+
+    while (httpsClient.available()) {
+      response += (char)httpsClient.read();
+      maybeUpdateLed();
+    }
+
+    httpsClient.stop();
+  } else {
     Serial.println("HTTPS connect FAIL");
     lcdStatusLine("OpenAI connect FAIL");
-    return "";
   }
-
-  // Build HTTPS request by hand
-  String req;
-  req += "POST ";
-  req += OPENAI_ENDPOINT;
-  req += " HTTP/1.1\r\n";
-  req += "Host: ";
-  req += OPENAI_HOST;
-  req += "\r\n";
-  req += "Authorization: Bearer ";
-  req += OPENAI_API_KEY;
-  req += "\r\n";
-  req += "Content-Type: application/json\r\n";
-  req += "Connection: close\r\n";
-  req += "Content-Length: ";
-  req += String(body.length());
-  req += "\r\n\r\n";
-  req += body;
-
-  httpsClient.print(req);
-
-  // Skip response headers
-  while (httpsClient.connected()) {
-    String line = httpsClient.readStringUntil('\n');
-    if (line == "\r") break;
-  }
-
-  // Read response body
-  String response = "";
-  while (httpsClient.available()) {
-    response += (char)httpsClient.read();
-  }
-
-  httpsClient.stop();
 
   Serial.println("---- Raw Response ----");
   Serial.println(response);
   Serial.println("----------------------");
-
+  markActivity();
+  ledExitBusy();
   return response;
 }
 
@@ -674,7 +843,11 @@ void typeReplyOverUSB(const String& text) {
     char c = text[i];
     HidKeyboard.print(c);  // print single char
     delay(5);              // mild pacing
+    if ((i & 0x0F) == 0) {
+      markActivity();
+    }
   }
+  markActivity();
 }
 
 // ------------------------------------------------------------
@@ -687,6 +860,7 @@ void typeReplyOverUSB(const String& text) {
 void viewAssistantReplyInteractive() {
   lcdShowAssistantReplyWindow();
   lcdStatusLine(";/.:scroll GO:type ENTER:exit");
+  markActivity();
 
   bool prevEnter = false;
   bool prevGo    = false;
@@ -696,10 +870,20 @@ void viewAssistantReplyInteractive() {
 
   while (true) {
     M5Cardputer.update();
+    maybeUpdateLed();
+    maybeUpdateBatteryIndicator();
+    checkDisplaySleep();
+    bool woke = wakeDisplayIfNeeded();
+    if (woke) {
+      lcdShowAssistantReplyWindow();
+      lcdStatusLine(";/.:scroll GO:type ENTER:exit");
+    }
+
     auto ks = M5Cardputer.Keyboard.keysState();
 
     // -- EXIT on ENTER --
     if (ks.enter && !prevEnter) {
+      markActivity();
       return;
     }
     prevEnter = ks.enter;
@@ -707,6 +891,7 @@ void viewAssistantReplyInteractive() {
     // -- GO button to type the last assistant reply --
     bool goNow = M5Cardputer.BtnA.isPressed();
     if (goNow && !prevGo) {
+      markActivity();
       // Send keystrokes over USB
       lcdStatusLine("Typing reply over HID...");
       typeReplyOverUSB(lastAssistantReply);
@@ -731,12 +916,14 @@ void viewAssistantReplyInteractive() {
         if (c_now == ';') {
           // scroll UP
           if (scrollOffset > 0) {
+            markActivity();
             scrollOffset--;
             lcdShowAssistantReplyWindow();
           }
         } else if (c_now == '.') {
           // scroll DOWN
           if (scrollOffset < (int)replyLines.size() - 1) {
+            markActivity();
             scrollOffset++;
             lcdShowAssistantReplyWindow();
           }
@@ -758,6 +945,7 @@ String readPromptFromKeyboard() {
   inputBuffer = "";
   lcdShowPromptEditing(inputBuffer);
   lcdStatusLine("Type. ENTER=send");
+  markActivity();
 
   std::vector<char> prevHeld;
   bool prevBackspace = false;
@@ -774,8 +962,11 @@ String readPromptFromKeyboard() {
     voiceTempFile.close();
     voiceTempFile = File();
   }
-  if (SD.exists(VOICE_TEMP_PATH)) {
-    SD.remove(VOICE_TEMP_PATH);
+  if (mountSD()) {
+    if (SD.exists(VOICE_TEMP_PATH)) {
+      SD.remove(VOICE_TEMP_PATH);
+    }
+    unmountSD();
   }
 
   auto removeLast = [&]() {
@@ -786,6 +977,17 @@ String readPromptFromKeyboard() {
 
   while (true) {
     M5Cardputer.update();
+    maybeUpdateLed();
+    maybeUpdateBatteryIndicator();
+    checkDisplaySleep();
+    bool woke = wakeDisplayIfNeeded();
+    if (woke) {
+      lcdShowPromptEditing(inputBuffer);
+      if (!currentStatusLine.isEmpty()) {
+        lcdStatusLine(currentStatusLine);
+      }
+    }
+
     auto ks = M5Cardputer.Keyboard.keysState();
     bool goNow = M5Cardputer.BtnA.isPressed();
     bool backspaceNow = ks.del;
@@ -793,6 +995,7 @@ String readPromptFromKeyboard() {
 
     // Voice recording handling when GO button is held
     if (goNow && !prevGoButton && !voiceRecording) {
+      markActivity();
       if (voiceTranscribing) {
         lcdStatusLine("Voice busy... finishing prior clip");
         prevGoButton = goNow;
@@ -815,25 +1018,38 @@ String readPromptFromKeyboard() {
         voiceTempFile.close();
         voiceTempFile = File();
       }
-      ensureDirectory(VOICE_TEMP_DIR);
-      SD.remove(VOICE_TEMP_PATH);
-      voiceTempFile = SD.open(VOICE_TEMP_PATH, FILE_WRITE);
-      if (!voiceTempFile) {
-        lcdStatusLine("Voice file open failed.");
-      } else if (!voiceTempFile.seek(0)) {
-        lcdStatusLine("Voice file prep failed.");
-        voiceTempFile.close();
-        voiceTempFile = File();
-      } else if (!M5Cardputer.Mic.begin()) {
-        lcdStatusLine("Mic init failed.");
+      if (!mountSD()) {
+        lcdStatusLine("SD mount fail.");
+      } else if (!ensureDirectory(VOICE_TEMP_DIR)) {
+        lcdStatusLine("Voice dir fail.");
+        unmountSD();
       } else {
-        voiceRecording = true;
+        SD.remove(VOICE_TEMP_PATH);
+        voiceTempFile = SD.open(VOICE_TEMP_PATH, FILE_WRITE);
+        if (!voiceTempFile) {
+          lcdStatusLine("Voice file open failed.");
+          unmountSD();
+        } else if (!voiceTempFile.seek(0)) {
+          lcdStatusLine("Voice file prep failed.");
+          voiceTempFile.close();
+          voiceTempFile = File();
+          unmountSD();
+        } else if (!M5Cardputer.Mic.begin()) {
+          lcdStatusLine("Mic init failed.");
+          voiceTempFile.close();
+          voiceTempFile = File();
+          unmountSD();
+        } else {
+          voiceRecording = true;
+          ledEnterBusy();
+        }
       }
     }
 
     if (voiceRecording) {
       static int16_t chunk[VOICE_CHUNK_SAMPLES];
       if (M5Cardputer.Mic.record(chunk, VOICE_CHUNK_SAMPLES, VOICE_SAMPLE_RATE)) {
+        markActivity();
         size_t remaining = (voiceSampleCount < VOICE_MAX_SAMPLES)
                          ? (VOICE_MAX_SAMPLES - voiceSampleCount)
                          : 0;
@@ -854,6 +1070,7 @@ String readPromptFromKeyboard() {
       bool maxSamplesReached = voiceSampleCount >= VOICE_MAX_SAMPLES;
       bool timeExceeded = (millis() - voiceStartMs) >= VOICE_MAX_DURATION_MS || maxSamplesReached || voiceWriteError;
       if (!goNow || timeExceeded) {
+        markActivity();
         if (voiceWriteError) {
           lcdStatusLine("Voice write failed.");
         } else if (voiceSampleCount == 0) {
@@ -880,6 +1097,7 @@ String readPromptFromKeyboard() {
           voiceTranscribing = true;
           String transcript = transcribeVoiceFile(voiceRecordedSamples);
           voiceTranscribing = false;
+          markActivity();
           if (transcript.length() > 0) {
             if (inputBuffer.length() > 0 && inputBuffer.charAt(inputBuffer.length() - 1) != ' ') {
               inputBuffer += ' ';
@@ -893,13 +1111,15 @@ String readPromptFromKeyboard() {
         }
 
         voiceRecording = false;
-        if (SD.exists(VOICE_TEMP_PATH)) {
+        if (sdMounted && SD.exists(VOICE_TEMP_PATH)) {
           SD.remove(VOICE_TEMP_PATH);
         }
         voiceTempFile = File();
         voiceFileReady = false;
         voiceRecordedSamples = 0;
         voiceTranscribing = false;
+        unmountSD();
+        ledExitBusy();
       }
 
       prevGoButton = goNow;
@@ -914,6 +1134,7 @@ String readPromptFromKeyboard() {
     // 1. dedicated delete/backspace flag if present
     //    you said ks.del works on your firmware
     if (backspaceNow && !prevBackspace) {
+      markActivity();
       removeLast();
     }
     prevBackspace = backspaceNow;
@@ -933,20 +1154,24 @@ String readPromptFromKeyboard() {
 
         if (code == 0x7F || code == 0x2A) {
           // backspace/delete from keycode
+          markActivity();
           removeLast();
         }
         else if (code == '\t') {
           // tab => 4 spaces
+          markActivity();
           inputBuffer += "    ";
         }
         else if (code == '\n') {
           // newline in ks.word means Enter
+          markActivity();
           String finalPrompt = inputBuffer;
           finalPrompt.trim();
           return finalPrompt;
         }
         else if (code >= 0x20 && code <= 0x7E) {
           // printable ASCII
+          markActivity();
           inputBuffer += (char)code;
         }
         else {
@@ -959,6 +1184,7 @@ String readPromptFromKeyboard() {
 
     // 3. ENTER via ks.enter flag
     if (ks.enter) {
+      markActivity();
       String finalPrompt = inputBuffer;
       finalPrompt.trim();
       return finalPrompt;
@@ -989,6 +1215,9 @@ void setup() {
   lcdClearAll();
   lcdHeader("Cardputer AI Assistant");
   lcdStatusLine("Booting...");
+  displaySleeping = false;
+  lastActivityMs = millis();
+  lastBatteryUpdateMs = millis();
 
   // init USB HID keyboard
   USB.begin();
@@ -1000,8 +1229,11 @@ void setup() {
     Serial.println("No valid config on SD!");
     delay(2000);
   }
-  ensureDirectory(VOICE_TEMP_DIR);
-  ensureDirectory(TRANSCRIPT_DIR);
+  if (mountSD()) {
+    ensureDirectory(VOICE_TEMP_DIR);
+    ensureDirectory(TRANSCRIPT_DIR);
+    unmountSD();
+  }
 
   // connect WiFi + HTTPS
   connectWiFi();
@@ -1011,6 +1243,7 @@ void setup() {
   resetConversationState();
 
   lcdStatusLine("Ready. Type prompt.");
+  markActivity();
 }
 
 void loop() {
@@ -1018,6 +1251,7 @@ void loop() {
   String userMsg = readPromptFromKeyboard();
   if (userMsg.isEmpty()) {
     lcdStatusLine("Empty. Type again.");
+    markActivity();
     return;
   }
   if (userMsg.equalsIgnoreCase("/context")) {
@@ -1035,6 +1269,7 @@ void loop() {
     } else {
       lcdStatusLine("Context save failed.");
     }
+    markActivity();
     delay(900);
     return;
   }
@@ -1045,11 +1280,13 @@ void loop() {
   // Show frozen prompt while querying
   lcdShowPromptEditing(userMsg);
   lcdStatusLine("Asking model...");
+  markActivity();
 
   // 3. Send entire conversation to OpenAI
   String raw = callOpenAI();
   if (raw.isEmpty()) {
     lcdStatusLine("Request failed.");
+    markActivity();
     return;
   }
 
@@ -1069,4 +1306,5 @@ void loop() {
 
   // 8. Ready for next turn
   lcdStatusLine("Done. ENTER new prompt.");
+  markActivity();
 }

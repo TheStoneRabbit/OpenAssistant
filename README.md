@@ -8,6 +8,7 @@ This sketch turns an M5Stack Cardputer (ESP32-S3) into a handheld ChatGPT client
 - Displays replies in a scrollable UI and can “type” the last answer into a connected host via USB keyboard emulation.
 - Optional voice input: hold the `GO` button while editing to record audio, transcribe it with OpenAI (`gpt-4o-mini-transcribe`), and append the text into your prompt.
 - `/context` command saves the current conversation to `transcripts/` on the SD card and starts a fresh session.
+- Live battery percentage in the header plus automatic screen sleep/wake after 1 minute of inactivity.
 
 ## Hardware & Software Requirements
 - M5Stack Cardputer (ESP32-S3) with TinyUSB HID support enabled.
@@ -46,6 +47,7 @@ Lines starting with `#` are treated as comments. The file is read during boot; m
    - `;` scrolls up, `.` scrolls down.
    - `GO` types the full reply into the host computer via USB HID.
    - `ENTER` exits view mode and returns to prompt editing.
+6. If you leave the device idle for ~1 minute the display sleeps to save power; press any key or button to wake it up (the UI restores automatically).
 
 ## Troubleshooting
 - **Wi-Fi stuck on “connecting”**: double-check SSID/password and that the SD card was detected.
