@@ -81,6 +81,7 @@ const char* VOICE_TEMP_PATH = "/oa_tmp/voice.raw";
 const char* TRANSCRIPT_DIR = "/transcripts";
 const char* TTS_CACHE_DIR = "/tts_cache";
 const char* TTS_CACHE_PATH = "/tts_cache/last.pcm";
+const char* RESPONSE_TEMP_PATH = "/oa_tmp/response.json";
 
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 
@@ -2432,47 +2433,63 @@ String buildRequestBody() {
 }
 
 // ------------------------------------------------------------
-// Send POST to OpenAI over HTTPS and capture the raw JSON reply
+// Send POST to OpenAI and stream the JSON reply to SD storage
 // ------------------------------------------------------------
-String callOpenAI() {
+bool callOpenAI(String& outResponsePath) {
   ledEnterBusy();
-  String body = buildRequestBody();
-
   lcdStatusLine("Querying OpenAI...");
   markActivity();
 
-  String response = "";
+  outResponsePath = "";
+  String body = buildRequestBody();
 
   httpsClient.stop();
   httpsClient.setInsecure();
   httpsClient.setTimeout(15000);
 
-  if (httpsClient.connect(OPENAI_HOST, OPENAI_PORT)) {
-    String req;
-    req += "POST ";
-    req += OPENAI_ENDPOINT;
-    req += " HTTP/1.1\r\n";
-    req += "Host: ";
-    req += OPENAI_HOST;
-    req += "\r\n";
-    req += "Authorization: Bearer ";
-    req += OPENAI_API_KEY;
-    req += "\r\n";
-    req += "Content-Type: application/json\r\n";
-    req += "Connection: close\r\n";
-    req += "Content-Length: ";
-    req += String(body.length());
-    req += "\r\n\r\n";
-    req += body;
+  bool success = false;
+  bool sdReady = false;
+  File responseFile;
+  String statusLine = "";
 
-    httpsClient.print(req);
+  do {
+    if (!httpsClient.connect(OPENAI_HOST, OPENAI_PORT)) {
+      lcdStatusLine("OpenAI connect FAIL");
+      break;
+    }
 
-    String statusLine = "";
+    if (!mountSD()) {
+      lcdStatusLine("SD mount fail");
+      break;
+    }
+    sdReady = true;
+    if (!ensureDirectory(VOICE_TEMP_DIR)) {
+      lcdStatusLine("Resp dir fail");
+      break;
+    }
+    if (SD.exists(RESPONSE_TEMP_PATH)) {
+      SD.remove(RESPONSE_TEMP_PATH);
+    }
+    responseFile = SD.open(RESPONSE_TEMP_PATH, FILE_WRITE);
+    if (!responseFile) {
+      lcdStatusLine("Resp file fail");
+      break;
+    }
+
+    httpsClient.print(String("POST ") + OPENAI_ENDPOINT + " HTTP/1.1\r\n");
+    httpsClient.print(String("Host: ") + OPENAI_HOST + "\r\n");
+    httpsClient.print(String("Authorization: Bearer ") + OPENAI_API_KEY + "\r\n");
+    httpsClient.print("Content-Type: application/json\r\n");
+    httpsClient.print("Connection: close\r\n");
+    httpsClient.print(String("Content-Length: ") + String(body.length()) + "\r\n\r\n");
+    httpsClient.print(body);
+
     String headerAccum = "";
     bool headersFinished = false;
+    bool streamOk = true;
     unsigned long lastRead = millis();
 
-    while (httpsClient.connected() || httpsClient.available()) {
+    while ((httpsClient.connected() || httpsClient.available()) && streamOk) {
       while (httpsClient.available()) {
         char c = httpsClient.read();
         lastRead = millis();
@@ -2488,7 +2505,7 @@ String callOpenAI() {
             headerAccum = "";
           }
         } else {
-          response += c;
+          responseFile.write(static_cast<uint8_t>(c));
         }
       }
 
@@ -2499,22 +2516,49 @@ String callOpenAI() {
       maybeUpdateLed();
       if (millis() - lastRead > 30000) {
         lcdStatusLine("OpenAI read timeout");
+        streamOk = false;
         break;
       }
       delay(10);
     }
 
-    httpsClient.stop();
-    if (statusLine.length()) {
-      lcdStatusLine("HTTP status: " + statusLine);
+    if (!headersFinished) {
+      streamOk = false;
+      lcdStatusLine("OpenAI headers fail");
     }
-  } else {
-    lcdStatusLine("OpenAI connect FAIL");
+
+    if (!streamOk) {
+      break;
+    }
+
+    responseFile.flush();
+    responseFile.close();
+    responseFile = File();
+    outResponsePath = String(RESPONSE_TEMP_PATH);
+    success = true;
+  } while (false);
+
+  httpsClient.stop();
+  if (responseFile) {
+    responseFile.flush();
+    responseFile.close();
+    responseFile = File();
+  }
+  if (!success && sdReady) {
+    if (SD.exists(RESPONSE_TEMP_PATH)) {
+      SD.remove(RESPONSE_TEMP_PATH);
+    }
+  }
+  if (sdReady) {
+    unmountSD();
+  }
+  if (statusLine.length()) {
+    lcdStatusLine("HTTP status: " + statusLine);
   }
 
   markActivity();
   ledExitBusy();
-  return response;
+  return success;
 }
 
 void collectResponseText(JsonVariantConst node, String& out) {
@@ -2577,13 +2621,31 @@ void collectResponseText(JsonVariantConst node, String& out) {
 }
 
 // ------------------------------------------------------------
-// Parse assistant text from OpenAI Responses API JSON.
+// Parse assistant text from an OpenAI response JSON file.
 // Supports both legacy `output[].content[].text` layout and
 // the newer `output_text` helper plus nested structures.
 // ------------------------------------------------------------
-String parseAssistantReply(const String& rawJson) {
-  DynamicJsonDocument doc(16384);
-  DeserializationError err = deserializeJson(doc, rawJson);
+String parseAssistantReplyFromFile(const String& path) {
+  if (!mountSD()) {
+    lcdStatusLine("Resp read fail");
+    return "[SD error]";
+  }
+
+  File f = SD.open(path, FILE_READ);
+  if (!f) {
+    lcdStatusLine("Resp open fail");
+    unmountSD();
+    return "[SD error]";
+  }
+
+  DynamicJsonDocument doc(32768);
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  if (SD.exists(path)) {
+    SD.remove(path);
+  }
+  unmountSD();
+
   if (err) {
     lcdStatusLine("JSON parse error: " + String(err.c_str()));
     return "[JSON parse error]";
@@ -3224,16 +3286,16 @@ void loop() {
   lcdStatusLine("Asking model...");
   markActivity();
 
-  // 3. Send entire conversation to OpenAI
-  String raw = callOpenAI();
-  if (raw.isEmpty()) {
+  // 3. Send entire conversation to OpenAI (response saved to SD)
+  String responsePath;
+  if (!callOpenAI(responsePath)) {
     lcdStatusLine("Request failed.");
     markActivity();
     return;
   }
 
   // 4. Parse assistant reply string
-  String reply = parseAssistantReply(raw);
+  String reply = parseAssistantReplyFromFile(responsePath);
   reply = normalizeQuotes(reply);
   // 5. Save reply to chat history + remember it for GO typing
   addMessageToHistory("assistant", reply);
