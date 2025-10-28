@@ -4,7 +4,7 @@ This sketch turns an M5Stack Cardputer (ESP32-S3) into a handheld ChatGPT client
 
 ## Highlights
 - Connects to Wi-Fi using credentials loaded from `/chat_config.txt` on the SD card.
-- Sends rolling conversation context to OpenAI’s `responses` API (`gpt-4o-mini` by default).
+- Sends rolling conversation context to OpenAI’s `responses` API (`gpt-5-mini` by default).
 - Displays replies in a scrollable UI and can “type” the last answer into a connected host via USB keyboard emulation.
 - Optional voice input: hold the `GO` button while editing to record audio, transcribe it with OpenAI (`gpt-4o-mini-transcribe`), and append the text into your prompt.
 - `/context` command saves the current conversation to `transcripts/` on the SD card and starts a fresh session.
@@ -17,7 +17,7 @@ This sketch turns an M5Stack Cardputer (ESP32-S3) into a handheld ChatGPT client
 - M5Stack Cardputer (ESP32-S3) with TinyUSB HID support enabled.
 - MicroSD card formatted as FAT32.
 - Arduino IDE (or PlatformIO) with the M5Stack board support package installed.
-- OpenAI API key with access to `gpt-4o-mini` and `gpt-4o-mini-transcribe`.
+- OpenAI API key with access to `gpt-5-mini` and `gpt-4o-mini-transcribe`.
 
 ## SD Card Configuration
 Create `/chat_config.txt` on the SD card with:

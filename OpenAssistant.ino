@@ -53,7 +53,7 @@ const char* OPENAI_HOST     = "api.openai.com";
 const int   OPENAI_PORT     = 443;
 const char* OPENAI_ENDPOINT = "/v1/responses";
 const char* OPENAI_TRANSCRIBE_ENDPOINT = "/v1/audio/transcriptions";
-const char* MODEL_NAME       = "gpt-4o-mini";
+const char* MODEL_NAME       = "gpt-5-mini";
 const char* TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe";
 const char* SYSTEM_PROMPT_TEXT =
   "You are a helpful assistant on a tiny handheld called the Cardputer. "
@@ -87,7 +87,7 @@ const int PROMPT_AREA_HEIGHT = SCREEN_HEIGHT > PROMPT_AREA_Y ? SCREEN_HEIGHT - P
 const int REPLY_AREA_Y       = PROMPT_AREA_Y;
 
 const uint32_t INACTIVITY_TIMEOUT_MS      = 60000;
-const uint32_t BATTERY_UPDATE_INTERVAL_MS = 5000;
+const uint32_t BATTERY_UPDATE_INTERVAL_MS = 60000;
 
 // ---------- GLOBALS ----------
 
@@ -110,6 +110,9 @@ int scrollOffset = 0;
 String lastAssistantReply = "";
 String headerTitle = "Cardputer AI";
 String statusBaseLine = "";
+String lastRenderedStatusText = "";
+int lastRenderedStatusOffset = -9999;
+String lastRenderedBatteryText = "";
 
 // Voice recording state (SD-backed)
 File voiceTempFile;
@@ -118,7 +121,7 @@ bool voiceFileReady = false;
 bool voiceTranscribing = false;
 bool displaySleeping = false;
 unsigned long lastActivityMs = 0;
-unsigned long lastBatteryUpdateMs = 0;
+unsigned long lastBatteryDrawMs = 0;
 bool sdMounted = false;
 unsigned long lastStatusScrollUpdateMs = 0;
 int statusScrollOffset = 0;
@@ -526,6 +529,9 @@ void addMessageToHistory(const String& role, const String& text) {
 
 void lcdClearAll() {
   M5Cardputer.Display.fillScreen(BLACK);
+  lastRenderedStatusText = "";
+  lastRenderedStatusOffset = -9999;
+  lastRenderedBatteryText = "";
 }
 
 int getBatteryPercent() {
@@ -553,10 +559,20 @@ String batteryText() {
   return "--%";
 }
 
-void updateHeaderBattery() {
+void updateHeaderBattery(bool force) {
   if (displaySleeping) return;
-  M5Cardputer.Display.setTextSize(HEADER_TEXT_SIZE);
+  unsigned long now = millis();
+  if (!force && (now - lastBatteryDrawMs) < BATTERY_UPDATE_INTERVAL_MS) {
+    return;
+  }
   String batt = batteryText();
+  if (!lastRenderedBatteryText.isEmpty() && batt == lastRenderedBatteryText) {
+    if (!force) {
+      lastBatteryDrawMs = now;
+      return;
+    }
+  }
+  M5Cardputer.Display.setTextSize(HEADER_TEXT_SIZE);
   int padding = 4;
   int width = M5Cardputer.Display.textWidth(batt.c_str());
   int x = SCREEN_WIDTH - width - padding;
@@ -565,6 +581,8 @@ void updateHeaderBattery() {
   M5Cardputer.Display.setCursor(x, 6);
   M5Cardputer.Display.setTextColor(WHITE, BLUE);
   M5Cardputer.Display.print(batt);
+  lastRenderedBatteryText = batt;
+  lastBatteryDrawMs = now;
 }
 
 void renderStatusLineInner(bool force);
@@ -905,7 +923,8 @@ void lcdHeader(const String& msg) {
   }
   M5Cardputer.Display.setCursor(padding, 6);
   M5Cardputer.Display.print(title);
-  updateHeaderBattery();
+  lastRenderedBatteryText = "";
+  updateHeaderBattery(true);
 }
 
 void lcdStatusLine(const String& msg) {
@@ -958,7 +977,13 @@ void lcdShowPromptEditing(const String& current) {
 // Convert the assistant's full reply string into wrapped lines
 // and reset scrollOffset.
 void prepareReplyLinesFromText(const String& replyText) {
-  replyLines = wrapTextToLines(replyText, SCREEN_WIDTH - CONTENT_MARGIN_X * 2, CONTENT_TEXT_SIZE);
+  M5Cardputer.Display.setTextSize(REPLY_TEXT_SIZE);
+  int labelWidth = M5Cardputer.Display.textWidth("AI:");
+  int indent = CONTENT_MARGIN_X + labelWidth + (REPLY_TEXT_SIZE * 6);
+  int availableWidth = SCREEN_WIDTH - indent - CONTENT_MARGIN_X;
+  if (availableWidth < 40) availableWidth = 40;
+
+  replyLines = wrapTextToLines(replyText, availableWidth, REPLY_TEXT_SIZE);
   if (replyLines.empty()) {
     replyLines.push_back("");
   }
@@ -976,22 +1001,31 @@ void lcdShowAssistantReplyWindow() {
   M5Cardputer.Display.setTextSize(REPLY_TEXT_SIZE);
   M5Cardputer.Display.setTextColor(GREEN, BLACK);
   M5Cardputer.Display.setCursor(CONTENT_MARGIN_X, startY);
-  M5Cardputer.Display.println("AI:");
+  M5Cardputer.Display.print("AI:");
 
+  int indent = CONTENT_MARGIN_X + M5Cardputer.Display.textWidth("AI:") + (REPLY_TEXT_SIZE * 6);
   int lineHeight = lineHeightForSize(REPLY_TEXT_SIZE);
-  int contentStartY = startY + lineHeight;
   int maxLinesOnScreen = visibleReplyLines();
-  int maxOffset = (int)replyLines.size() - maxLinesOnScreen;
+  int totalVisible = maxLinesOnScreen + 1;
+  int maxOffset = (int)replyLines.size() - totalVisible;
   if (maxOffset < 0) maxOffset = 0;
   if (scrollOffset > maxOffset) scrollOffset = maxOffset;
 
   M5Cardputer.Display.setTextColor(WHITE, BLACK);
+  if (!replyLines.empty()) {
+    int firstIdx = scrollOffset;
+    if (firstIdx >= 0 && firstIdx < (int)replyLines.size()) {
+      M5Cardputer.Display.setCursor(indent, startY);
+      M5Cardputer.Display.print(replyLines[firstIdx]);
+    }
+  }
+
   for (int i = 0; i < maxLinesOnScreen; ++i) {
-    int idx = scrollOffset + i;
+    int idx = scrollOffset + 1 + i;
     if (idx < 0 || idx >= (int)replyLines.size()) break;
-    int y = contentStartY + i * lineHeight;
+    int y = startY + (i + 1) * lineHeight;
     if (y >= SCREEN_HEIGHT) break;
-    M5Cardputer.Display.setCursor(CONTENT_MARGIN_X, y);
+    M5Cardputer.Display.setCursor(indent, y);
     M5Cardputer.Display.print(replyLines[idx]);
   }
 }
@@ -1339,19 +1373,73 @@ String callOpenAI() {
   return response;
 }
 
+void collectResponseText(JsonVariantConst node, String& out) {
+  if (node.isNull()) return;
+
+  auto appendText = [&](const String& piece) {
+    if (piece.length() == 0) return;
+    if (out.length() > 0) out += "\n";
+    out += piece;
+  };
+
+  if (node.is<const char*>()) {
+    appendText(String(node.as<const char*>()));
+    return;
+  }
+  if (node.is<String>()) {
+    appendText(node.as<String>());
+    return;
+  }
+
+  if (node.is<JsonArrayConst>()) {
+    for (JsonVariantConst item : node.as<JsonArrayConst>()) {
+      collectResponseText(item, out);
+    }
+    return;
+  }
+
+  if (node.is<JsonObjectConst>()) {
+    JsonObjectConst obj = node.as<JsonObjectConst>();
+
+    if (obj.containsKey("text")) {
+      collectResponseText(obj["text"], out);
+    }
+    if (obj.containsKey("value")) {
+      collectResponseText(obj["value"], out);
+    }
+    if (obj.containsKey("content")) {
+      collectResponseText(obj["content"], out);
+    }
+    if (obj.containsKey("output_text")) {
+      collectResponseText(obj["output_text"], out);
+    }
+    if (obj.containsKey("delta")) {
+      collectResponseText(obj["delta"], out);
+    }
+
+    for (JsonPairConst kv : obj) {
+      const char* key = kv.key().c_str();
+      if (!key) continue;
+      if (strcmp(key, "type") == 0 || strcmp(key, "role") == 0 || strcmp(key, "id") == 0 || strcmp(key, "index") == 0) {
+        continue;
+      }
+      if (strcmp(key, "text") == 0 || strcmp(key, "value") == 0 || strcmp(key, "content") == 0 ||
+          strcmp(key, "output_text") == 0 || strcmp(key, "delta") == 0) {
+        continue;
+      }
+      collectResponseText(kv.value(), out);
+    }
+    return;
+  }
+}
+
 // ------------------------------------------------------------
-// Parse assistant text from OpenAI Responses API JSON
-//   We expect shape like:
-//   {
-//     "output":[
-//       {
-//         "content":[{"text":"..."}]
-//       }
-//     ]
-//   }
+// Parse assistant text from OpenAI Responses API JSON.
+// Supports both legacy `output[].content[].text` layout and
+// the newer `output_text` helper plus nested structures.
 // ------------------------------------------------------------
 String parseAssistantReply(const String& rawJson) {
-  DynamicJsonDocument doc(8192);
+  DynamicJsonDocument doc(16384);
   DeserializationError err = deserializeJson(doc, rawJson);
   if (err) {
     Serial.print("JSON parse error: ");
@@ -1359,17 +1447,25 @@ String parseAssistantReply(const String& rawJson) {
     return "[JSON parse error]";
   }
 
-  JsonArray outputArr = doc["output"].as<JsonArray>();
-  if (!outputArr.size()) {
-    return "[No output]";
+  String text = "";
+
+  JsonVariantConst outputTextVar = doc["output_text"];
+  if (!outputTextVar.isNull()) {
+    collectResponseText(outputTextVar, text);
   }
 
-  JsonArray contentArr = outputArr[0]["content"].as<JsonArray>();
-  if (!contentArr.size()) {
+  if (text.length() == 0) {
+    JsonArrayConst outputArr = doc["output"].as<JsonArrayConst>();
+    for (JsonVariantConst item : outputArr) {
+      JsonVariantConst content = item["content"];
+      collectResponseText(content, text);
+    }
+  }
+
+  if (text.length() == 0) {
     return "[No content]";
   }
 
-  String text = contentArr[0]["text"].as<String>();
   return text;
 }
 
@@ -1520,6 +1616,8 @@ String readPromptFromKeyboard() {
   lcdShowPromptEditing(inputBuffer);
   lcdStatusLine("Type. ENTER=send");
   markActivity();
+  String renderedPrompt = inputBuffer;
+  bool forcePromptRedraw = false;
 
   std::vector<char> prevHeld;
   bool prevBackspace = false;
@@ -1569,7 +1667,7 @@ String readPromptFromKeyboard() {
         continue;
       }
       wakeDisplayIfNeeded();
-      lcdShowPromptEditing(inputBuffer);
+      forcePromptRedraw = true;
       renderStatusLineInner(true);
       markActivity();
     }
@@ -1686,7 +1784,7 @@ String readPromptFromKeyboard() {
               inputBuffer += ' ';
             }
             inputBuffer += transcript;
-            lcdShowPromptEditing(inputBuffer);
+            forcePromptRedraw = true;
             lcdStatusLine("Voice added. ENTER=send");
           } else {
             lcdStatusLine("Voice failed. Try GO again.");
@@ -1773,8 +1871,12 @@ String readPromptFromKeyboard() {
       return finalPrompt;
     }
 
-    // 4. redraw prompt view
-    lcdShowPromptEditing(inputBuffer);
+    // 4. redraw prompt view only when needed
+    if (forcePromptRedraw || inputBuffer != renderedPrompt) {
+      lcdShowPromptEditing(inputBuffer);
+      renderedPrompt = inputBuffer;
+      forcePromptRedraw = false;
+    }
 
     // 5. update edge-detect state
     prevHeld = currHeld;
@@ -1801,7 +1903,7 @@ void setup() {
   lcdStatusLine("Booting...");
   displaySleeping = false;
   lastActivityMs = millis();
-  lastBatteryUpdateMs = millis();
+  lastBatteryDrawMs = millis();
 
   // init USB HID keyboard
   USB.begin();
@@ -1906,29 +2008,39 @@ String marqueeTextForStatus() {
 void renderStatusLineInner(bool force) {
   if (displaySleeping) return;
   unsigned long now = millis();
-  if (!force && (now - lastBatteryUpdateMs) < 100) {
-    return;
-  }
 
   String text = marqueeTextForStatus();
   M5Cardputer.Display.setTextSize(STATUS_TEXT_SIZE);
   int textWidth = M5Cardputer.Display.textWidth(text.c_str());
   int availableWidth = SCREEN_WIDTH - CONTENT_MARGIN_X * 2;
+
+  int newOffset = statusScrollOffset;
   if (textWidth <= availableWidth) {
-    statusScrollOffset = 0;
+    newOffset = 0;
   } else {
     const int scrollSpeed = 12;
-    if (!force && (now - lastStatusScrollUpdateMs) < 120) {
-      updateHeaderBattery();
-      return;
-    }
-    lastStatusScrollUpdateMs = now;
-    statusScrollOffset += scrollSpeed;
-    int maxOffset = textWidth + CONTENT_MARGIN_X;
-    if (statusScrollOffset > maxOffset) {
-      statusScrollOffset = 0;
+    if (force || text != lastRenderedStatusText) {
+      newOffset = 0;
+      lastStatusScrollUpdateMs = now;
+    } else if ((now - lastStatusScrollUpdateMs) >= 120) {
+      lastStatusScrollUpdateMs = now;
+      newOffset += scrollSpeed;
+      int maxOffset = textWidth + CONTENT_MARGIN_X;
+      if (newOffset > maxOffset) {
+        newOffset = 0;
+      }
     }
   }
+
+  bool needsRedraw = force ||
+                     text != lastRenderedStatusText ||
+                     newOffset != lastRenderedStatusOffset;
+  if (!needsRedraw) {
+    updateHeaderBattery(force);
+    return;
+  }
+
+  statusScrollOffset = newOffset;
 
   M5Cardputer.Display.fillRect(0, HEADER_HEIGHT, SCREEN_WIDTH, STATUS_HEIGHT, BLACK);
   M5Cardputer.Display.setCursor(CONTENT_MARGIN_X - statusScrollOffset, HEADER_HEIGHT + CONTENT_MARGIN_Y);
@@ -1940,8 +2052,9 @@ void renderStatusLineInner(bool force) {
     M5Cardputer.Display.print(text);
   }
 
-  lastBatteryUpdateMs = now;
-  updateHeaderBattery();
+  lastRenderedStatusText = text;
+  lastRenderedStatusOffset = statusScrollOffset;
+  updateHeaderBattery(force);
 }
 
 void renderStatusLine(bool force) {
