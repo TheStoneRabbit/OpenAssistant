@@ -75,7 +75,7 @@ const char* VOICE_TEMP_DIR = "/oa_tmp";
 const char* VOICE_TEMP_PATH = "/oa_tmp/voice.raw";
 const char* TRANSCRIPT_DIR = "/transcripts";
 const char* TTS_CACHE_DIR = "/tts_cache";
-const char* TTS_CACHE_PATH = "/tts_cache/last.wav";
+const char* TTS_CACHE_PATH = "/tts_cache/last.pcm";
 
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 
@@ -150,6 +150,7 @@ String ttsCachedText = "";
 String ttsCachedPath = "";
 bool ttsAudioReady = false;
 bool ttsBusy = false;
+bool isMuted = false;
 
 // ------------------------------------------------------------
 // Utility: trim whitespace from both ends of String
@@ -177,47 +178,6 @@ String normalizeQuotes(const String& text) {
 // ------------------------------------------------------------
 // Voice helper utilities
 // ------------------------------------------------------------
-static inline void writeLE16(uint8_t* dst, uint16_t value) {
-  dst[0] = value & 0xFF;
-  dst[1] = (value >> 8) & 0xFF;
-}
-
-static inline void writeLE32(uint8_t* dst, uint32_t value) {
-  dst[0] = value & 0xFF;
-  dst[1] = (value >> 8) & 0xFF;
-  dst[2] = (value >> 16) & 0xFF;
-  dst[3] = (value >> 24) & 0xFF;
-}
-
-static void fillWavHeader(uint8_t* header, size_t sampleCount, uint32_t sampleRate) {
-  size_t pcmBytes = sampleCount * sizeof(int16_t);
-  header[0] = 'R';
-  header[1] = 'I';
-  header[2] = 'F';
-  header[3] = 'F';
-  writeLE32(header + 4, pcmBytes + 36);
-  header[8] = 'W';
-  header[9] = 'A';
-  header[10] = 'V';
-  header[11] = 'E';
-  header[12] = 'f';
-  header[13] = 'm';
-  header[14] = 't';
-  header[15] = ' ';
-  writeLE32(header + 16, 16);  // Subchunk1Size
-  writeLE16(header + 20, 1);   // PCM
-  writeLE16(header + 22, 1);   // Mono
-  writeLE32(header + 24, sampleRate);
-  uint32_t byteRate = sampleRate * 2;  // mono, 16-bit
-  writeLE32(header + 28, byteRate);
-  writeLE16(header + 32, 2);   // block align
-  writeLE16(header + 34, 16);  // bits per sample
-  header[36] = 'd';
-  header[37] = 'a';
-  header[38] = 't';
-  header[39] = 'a';
-  writeLE32(header + 40, pcmBytes);
-}
 
 bool appendSamplesToVoiceFile(const int16_t* samples, size_t sampleCount) {
   if (!voiceTempFile) {
@@ -334,11 +294,10 @@ void resetConversationState() {
 String requestTranscriptionFromSD(size_t sampleCount) {
   File audioFile = SD.open(VOICE_TEMP_PATH, FILE_READ);
   if (!audioFile) {
-    Serial.println("Failed to open temp voice file for read.");
+    lcdStatusLine("Transcribe: file open failed.");
     return "";
   }
 
-  const size_t wavHeaderSize = 44;
   size_t pcmBytes = sampleCount * sizeof(int16_t);
   if (audioFile.size() > 0) {
     pcmBytes = audioFile.size();
@@ -360,6 +319,7 @@ String requestTranscriptionFromSD(size_t sampleCount) {
 
   String closing = "\r\n--" + boundary + "--\r\n";
 
+  const size_t wavHeaderSize = 44;
   size_t contentLength = partModel.length()
                          + partFormat.length()
                          + partAudioHeader.length()
@@ -372,7 +332,7 @@ String requestTranscriptionFromSD(size_t sampleCount) {
   httpsClient.setTimeout(30000);
 
   if (!httpsClient.connect(OPENAI_HOST, OPENAI_PORT)) {
-    Serial.println("Transcription HTTPS connect FAIL");
+    lcdStatusLine("Transcribe: HTTPS connect FAIL");
     return "";
   }
 
@@ -398,10 +358,26 @@ String requestTranscriptionFromSD(size_t sampleCount) {
   httpsClient.print(partModel);
   httpsClient.print(partFormat);
   httpsClient.print(partAudioHeader);
-  uint8_t header[44];
+  uint8_t header[wavHeaderSize];
   size_t sampleCountForHeader = pcmBytes / sizeof(int16_t);
-  fillWavHeader(header, sampleCountForHeader, VOICE_SAMPLE_RATE);
-  httpsClient.write(header, sizeof(header));
+
+  // Fill WAV header
+  header[0] = 'R'; header[1] = 'I'; header[2] = 'F'; header[3] = 'F';
+  writeLE32(header + 4, pcmBytes + 36); // File size - 8
+  header[8] = 'W'; header[9] = 'A'; header[10] = 'V'; header[11] = 'E';
+  header[12] = 'f'; header[13] = 'm'; header[14] = 't'; header[15] = ' ';
+  writeLE32(header + 16, 16); // Subchunk1Size
+  writeLE16(header + 20, 1);  // AudioFormat (PCM)
+  writeLE16(header + 22, 1);  // NumChannels (Mono)
+  writeLE32(header + 24, VOICE_SAMPLE_RATE); // SampleRate
+  uint32_t byteRate = VOICE_SAMPLE_RATE * 2; // ByteRate (SampleRate * NumChannels * BitsPerSample/8)
+  writeLE32(header + 28, byteRate);
+  writeLE16(header + 32, 2);  // BlockAlign (NumChannels * BitsPerSample/8)
+  writeLE16(header + 34, 16); // BitsPerSample
+  header[36] = 'd'; header[37] = 'a'; header[38] = 't'; header[39] = 'a';
+  writeLE32(header + 40, pcmBytes); // Subchunk2Size (data size)
+
+  httpsClient.write(header, wavHeaderSize);
   uint8_t ioBuf[512];
   while (audioFile.available()) {
     size_t rd = audioFile.read(ioBuf, sizeof(ioBuf));
@@ -444,7 +420,7 @@ String requestTranscriptionFromSD(size_t sampleCount) {
 
     maybeUpdateLed();
     if (millis() - lastRead > 30000) {
-      Serial.println("Transcription read timeout");
+      lcdStatusLine("Transcribe: read timeout");
       break;
     }
     delay(10);
@@ -460,13 +436,8 @@ String requestTranscriptionFromSD(size_t sampleCount) {
     }
   }
 
-  response.trim();
-  Serial.println("---- Transcription Response ----");
-  Serial.println(response);
-  Serial.println("--------------------------------");
   if (statusCode != 200) {
-    Serial.print("Transcription HTTP error: ");
-    Serial.println(statusCode);
+    lcdStatusLine("Transcribe HTTP error: " + String(statusCode));
     return "";
   }
   return response;
@@ -474,7 +445,7 @@ String requestTranscriptionFromSD(size_t sampleCount) {
 
 String transcribeVoiceFile(size_t sampleCount) {
   if (!sdMounted) {
-    Serial.println("SD not mounted for transcription.");
+    lcdStatusLine("Transcribe: SD not mounted.");
     return "";
   }
   return requestTranscriptionFromSD(sampleCount);
@@ -483,15 +454,16 @@ String transcribeVoiceFile(size_t sampleCount) {
 // ------------------------------------------------------------
 // Text-to-Speech helpers (GPT voice via OpenAI API)
 // ------------------------------------------------------------
-static inline uint16_t readLE16(const uint8_t* src) {
-  return (uint16_t)(src[0] | (src[1] << 8));
+static inline void writeLE16(uint8_t* dst, uint16_t value) {
+  dst[0] = value & 0xFF;
+  dst[1] = (value >> 8) & 0xFF;
 }
 
-static inline uint32_t readLE32(const uint8_t* src) {
-  return (uint32_t)src[0]
-       | ((uint32_t)src[1] << 8)
-       | ((uint32_t)src[2] << 16)
-       | ((uint32_t)src[3] << 24);
+static inline void writeLE32(uint8_t* dst, uint32_t value) {
+  dst[0] = value & 0xFF;
+  dst[1] = (value >> 8) & 0xFF;
+  dst[2] = (value >> 16) & 0xFF;
+  dst[3] = (value >> 24) & 0xFF;
 }
 
 static bool readLineFromClient(WiFiClientSecure& client, String& line, unsigned long timeoutMs) {
@@ -621,19 +593,19 @@ static bool readChunkedBodyToFile(WiFiClientSecure& client, File& file) {
 
 bool downloadTtsAudio(const String& text, String& outPath) {
   if (OPENAI_API_KEY.isEmpty()) {
-    Serial.println("TTS requires OPENAI_KEY");
+    lcdStatusLine("TTS requires OPENAI_KEY");
     return false;
   }
   if (text.isEmpty()) {
-    Serial.println("TTS: empty text");
+    lcdStatusLine("TTS: empty text");
     return false;
   }
   if (!mountSD()) {
-    Serial.println("TTS: SD mount failed");
+    lcdStatusLine("TTS: SD mount failed");
     return false;
   }
   if (!ensureDirectory(TTS_CACHE_DIR)) {
-    Serial.println("TTS: cache dir ensure failed");
+    lcdStatusLine("TTS: cache dir ensure failed");
     unmountSD();
     return false;
   }
@@ -643,7 +615,7 @@ bool downloadTtsAudio(const String& text, String& outPath) {
   }
   File audioFile = SD.open(TTS_CACHE_PATH, FILE_WRITE);
   if (!audioFile) {
-    Serial.println("TTS: cache file open failed");
+    lcdStatusLine("TTS: cache file open failed");
     unmountSD();
     return false;
   }
@@ -652,7 +624,7 @@ bool downloadTtsAudio(const String& text, String& outPath) {
   doc["model"] = TTS_MODEL_NAME;
   doc["voice"] = ttsVoice;
   doc["input"] = text;
-  doc["format"] = "wav";
+  doc["response_format"] = "pcm";
 
   String body;
   serializeJson(doc, body);
@@ -662,7 +634,7 @@ bool downloadTtsAudio(const String& text, String& outPath) {
   httpsClient.setTimeout(15000);
 
   if (!httpsClient.connect(OPENAI_HOST, OPENAI_PORT)) {
-    Serial.println("TTS HTTPS connect FAIL");
+    lcdStatusLine("TTS: HTTPS connect FAIL");
     audioFile.close();
     unmountSD();
     return false;
@@ -680,7 +652,7 @@ bool downloadTtsAudio(const String& text, String& outPath) {
   req += OPENAI_API_KEY;
   req += "\r\n";
   req += "Content-Type: application/json\r\n";
-  req += "Accept: audio/wav\r\n";
+  req += "Accept: audio/pcm\r\n";
   req += "Connection: close\r\n";
   req += "Content-Length: ";
   req += String(body.length());
@@ -712,9 +684,12 @@ bool downloadTtsAudio(const String& text, String& outPath) {
         if (lowered.startsWith("transfer-encoding:")) {
           if (lowered.indexOf("chunked") >= 0) {
             chunked = true;
+            Serial.println("TTS: Chunked transfer encoding detected.");
           }
         } else if (lowered.startsWith("content-length:")) {
           contentLength = trimmed.substring(trimmed.indexOf(':') + 1).toInt();
+          Serial.print("TTS: Content-Length: ");
+          Serial.println(contentLength);
         }
         if (headerLine == "\r\n") {
           headersFinished = true;
@@ -724,7 +699,7 @@ bool downloadTtsAudio(const String& text, String& outPath) {
     }
     if (!headersFinished) {
       if (millis() - lastRead > TTS_DOWNLOAD_TIMEOUT_MS) {
-        Serial.println("TTS header timeout");
+        lcdStatusLine("TTS: header timeout");
         httpsClient.stop();
         audioFile.close();
         unmountSD();
@@ -743,8 +718,7 @@ bool downloadTtsAudio(const String& text, String& outPath) {
     }
   }
   if (statusCode != 200) {
-    Serial.print("TTS HTTP error: ");
-    Serial.println(statusCode);
+    lcdStatusLine("TTS HTTP error: " + String(statusCode));
     httpsClient.stop();
     audioFile.close();
     if (SD.exists(TTS_CACHE_PATH)) {
@@ -763,13 +737,14 @@ bool downloadTtsAudio(const String& text, String& outPath) {
   audioFile.close();
 
   if (!ok) {
-    Serial.println("TTS: body read failed");
+    lcdStatusLine("TTS: body read failed");
     if (SD.exists(TTS_CACHE_PATH)) {
       SD.remove(TTS_CACHE_PATH);
     }
     unmountSD();
     return false;
   }
+  lcdStatusLine("TTS: Downloaded " + String(audioFile.size()) + " bytes.");
 
   outPath = String(TTS_CACHE_PATH);
   unmountSD();
@@ -778,121 +753,53 @@ bool downloadTtsAudio(const String& text, String& outPath) {
 
 bool playTtsFromSD(const String& path) {
   if (!mountSD()) {
-    Serial.println("TTS playback: SD mount failed");
+    lcdStatusLine("TTS playback: SD mount failed");
     return false;
   }
   File f = SD.open(path, FILE_READ);
   if (!f) {
-    Serial.println("TTS playback: file open failed");
+    lcdStatusLine("TTS playback: file open failed");
     unmountSD();
     return false;
   }
   size_t fileSize = f.size();
-  if (f.size() < 44) {
-    Serial.println("TTS playback: file too small");
+  if (fileSize == 0) {
+    lcdStatusLine("TTS playback: file empty");
     f.close();
     unmountSD();
     return false;
   }
 
   bool usedHeapCaps = true;
-  uint8_t* wavData = (uint8_t*)heap_caps_malloc(fileSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!wavData) {
+  uint8_t* pcmData = (uint8_t*)heap_caps_malloc(fileSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!pcmData) {
     usedHeapCaps = false;
-    wavData = (uint8_t*)malloc(fileSize);
+    pcmData = (uint8_t*)malloc(fileSize);
   }
-  if (!wavData) {
-    Serial.println("TTS playback: alloc failed");
+  if (!pcmData) {
+    lcdStatusLine("TTS playback: alloc failed");
     f.close();
     unmountSD();
     return false;
   }
 
-  size_t readTotal = f.read(wavData, fileSize);
+  size_t readTotal = f.read(pcmData, fileSize);
   f.close();
   unmountSD();
   if (readTotal != fileSize) {
-    Serial.println("TTS playback: read mismatch");
+    lcdStatusLine("TTS playback: read mismatch. Exp: " + String(fileSize) + ", Got: " + String(readTotal));
     if (usedHeapCaps) {
-      heap_caps_free(wavData);
+      heap_caps_free(pcmData);
     } else {
-      free(wavData);
+      free(pcmData);
     }
     return false;
   }
-  if (memcmp(wavData, "RIFF", 4) != 0 || memcmp(wavData + 8, "WAVE", 4) != 0) {
-    Serial.println("TTS playback: invalid header");
-    if (usedHeapCaps) {
-      heap_caps_free(wavData);
-    } else {
-      free(wavData);
-    }
-    return false;
-  }
+  lcdStatusLine("TTS playback: Read " + String(fileSize) + " bytes.");
 
-  uint32_t sampleRate = TTS_DEFAULT_SAMPLE_RATE;
-  uint16_t channels = 1;
-  uint16_t bitsPerSample = 16;
-  bool fmtFound = false;
-  bool dataFound = false;
-  size_t dataOffset = 0;
-  uint32_t dataSize = 0;
-
-  size_t pos = 12;
-  while (pos + 8 <= fileSize) {
-    uint8_t* chunk = wavData + pos;
-    uint32_t chunkSize = readLE32(chunk + 4);
-    size_t chunkDataPos = pos + 8;
-    if (chunkDataPos + chunkSize > fileSize) {
-      break;
-    }
-
-    if (memcmp(chunk, "fmt ", 4) == 0) {
-      if (chunkSize >= 16) {
-        fmtFound = true;
-        uint16_t audioFormat = readLE16(wavData + chunkDataPos);
-        channels = readLE16(wavData + chunkDataPos + 2);
-        sampleRate = readLE32(wavData + chunkDataPos + 4);
-        bitsPerSample = readLE16(wavData + chunkDataPos + 14);
-        if (audioFormat != 1) {
-          Serial.println("TTS playback: unsupported format");
-          break;
-        }
-      }
-    } else if (memcmp(chunk, "data", 4) == 0) {
-      dataOffset = chunkDataPos;
-      dataSize = chunkSize;
-      dataFound = true;
-      break;
-    }
-
-    size_t advance = 8 + chunkSize;
-    if (advance & 1) advance++;
-    pos += advance;
-  }
-
-  if (!fmtFound || !dataFound || bitsPerSample != 16 || (channels != 1 && channels != 2)) {
-    Serial.println("TTS playback: unsupported wav");
-    if (usedHeapCaps) {
-      heap_caps_free(wavData);
-    } else {
-      free(wavData);
-    }
-    return false;
-  }
-  if (dataOffset + dataSize > fileSize || dataSize == 0) {
-    Serial.println("TTS playback: invalid data region");
-    if (usedHeapCaps) {
-      heap_caps_free(wavData);
-    } else {
-      free(wavData);
-    }
-    return false;
-  }
-
-  int16_t* samplePtr = reinterpret_cast<int16_t*>(wavData + dataOffset);
-  size_t sampleCount = dataSize / sizeof(int16_t);
-  bool stereo = (channels == 2);
+  int16_t* samplePtr = reinterpret_cast<int16_t*>(pcmData);
+  size_t sampleCount = fileSize / sizeof(int16_t);
+  lcdStatusLine("TTS playback: Sample count: " + String(sampleCount));
 
   if (!M5Cardputer.Speaker.isEnabled()) {
     M5Cardputer.Speaker.begin();
@@ -903,18 +810,18 @@ bool playTtsFromSD(const String& path) {
   bool ok = M5Cardputer.Speaker.playRaw(
     samplePtr,
     sampleCount,
-    sampleRate,
-    stereo,
-    1,
-    -1,
-    true
+    TTS_DEFAULT_SAMPLE_RATE,
+    false, // stereo
+    1, // num_channels
+    -1, // i2s_port
+    true // free_data
   );
   if (!ok) {
-    Serial.println("TTS playback: playRaw failed");
+    lcdStatusLine("TTS playback: playRaw failed");
     if (usedHeapCaps) {
-      heap_caps_free(wavData);
+      heap_caps_free(pcmData);
     } else {
-      free(wavData);
+      free(pcmData);
     }
     return false;
   }
@@ -933,9 +840,9 @@ bool playTtsFromSD(const String& path) {
   }
   M5Cardputer.Speaker.stop();
   if (usedHeapCaps) {
-    heap_caps_free(wavData);
+    heap_caps_free(pcmData);
   } else {
-    free(wavData);
+    free(pcmData);
   }
   return true;
 }
@@ -953,6 +860,10 @@ void clearTtsCache() {
 }
 
 void speakLastAssistantReply() {
+  if (isMuted) {
+    lcdStatusLine("Muted.");
+    return;
+  }
   if (ttsBusy) {
     lcdStatusLine("TTS busy...");
     return;
@@ -1001,13 +912,13 @@ void speakLastAssistantReply() {
 // ------------------------------------------------------------
 bool loadConfigFromSD() {
   if (!mountSD()) {
-    Serial.println("SD init FAILED");
+    lcdStatusLine("SD init FAILED");
     return false;
   }
 
   File f = SD.open("/chat_config.txt", "r");
   if (!f) {
-    Serial.println("chat_config.txt MISSING");
+    lcdStatusLine("chat_config.txt MISSING");
     unmountSD();
     return false;
   }
@@ -1033,18 +944,16 @@ bool loadConfigFromSD() {
 
     if (key == "WIFI_SSID") {
       WIFI_SSID = value;
-      Serial.print("SSID: ");
-      Serial.println(WIFI_SSID);
+      lcdStatusLine("SSID: " + WIFI_SSID);
     } else if (key == "WIFI_PASS") {
       WIFI_PASS = value;
-      Serial.println("PASS: (hidden)");
+      lcdStatusLine("PASS: (hidden)");
     } else if (key == "OPENAI_KEY") {
       OPENAI_API_KEY = value;
-      Serial.println("KEY: (loaded)");
+      lcdStatusLine("KEY: (loaded)");
     } else if (key == "TTS_VOICE") {
       ttsVoice = value;
-      Serial.print("TTS voice: ");
-      Serial.println(ttsVoice);
+      lcdStatusLine("TTS voice: " + ttsVoice);
     }
   }
 
@@ -1052,11 +961,11 @@ bool loadConfigFromSD() {
   unmountSD();
 
   if (WIFI_SSID.isEmpty() || WIFI_PASS.isEmpty() || OPENAI_API_KEY.isEmpty()) {
-    Serial.println("Config missing one or more fields!");
+    lcdStatusLine("Config missing one or more fields!");
     return false;
   }
 
-  Serial.println("Config loaded OK.");
+  lcdStatusLine("Config loaded OK.");
   return true;
 }
 
@@ -1633,26 +1542,20 @@ void lcdShowUserPromptView() {
 void connectWiFi() {
   if (WIFI_SSID.isEmpty()) {
     lcdStatusLine("WiFi config missing. Use /wifi");
-    Serial.println("WiFi config missing.");
     return;
   }
 
   lcdStatusLine("WiFi: connecting...");
-  Serial.print("Connecting to WiFi: ");
-  Serial.println(WIFI_SSID);
 
   bool ok = connectToWiFi(WIFI_SSID, WIFI_PASS, WIFI_CONNECT_TIMEOUT_MS);
 
   if (ok) {
-    Serial.println("WiFi connected!");
-    Serial.print("IP: ");
-    Serial.println(WiFi.localIP());
     lcdStatusLine("WiFi OK: " + WiFi.localIP().toString());
   } else {
-    Serial.println("WiFi connection failed.");
     lcdStatusLine("WiFi failed. Use /wifi to set up");
   }
 }
+
 
 bool wifiInteractiveSetup() {
   lcdClearAll();
@@ -1669,7 +1572,6 @@ bool wifiInteractiveSetup() {
 
   if (networkCount <= 0) {
     lcdStatusLine("No networks found.");
-    Serial.println("WiFi scan returned no networks.");
     delay(1200);
     WiFi.scanDelete();
     return false;
@@ -1781,7 +1683,6 @@ bool wifiInteractiveSetup() {
   bool ok = connectToWiFi(chosenSsid, chosenPass, WIFI_CONNECT_TIMEOUT_MS);
   if (!ok) {
     lcdStatusLine("WiFi connect failed.");
-    Serial.println("Interactive WiFi connect failed.");
     delay(1200);
     return false;
   }
@@ -1790,7 +1691,6 @@ bool wifiInteractiveSetup() {
   WIFI_PASS = chosenPass;
 
   lcdStatusLine("WiFi connected!");
-  Serial.println("Interactive WiFi setup succeeded.");
   delay(800);
 
   String saveAnswer = readSimpleTextLine("Save network to SD? (y/n)");
@@ -1800,10 +1700,8 @@ bool wifiInteractiveSetup() {
     bool saved = writeConfigToSD();
     if (saved) {
       lcdStatusLine("Config saved.");
-      Serial.println("WiFi configuration saved to SD.");
     } else {
       lcdStatusLine("Failed to save config.");
-      Serial.println("Failed to save WiFi config to SD.");
     }
     delay(900);
   }
@@ -1852,10 +1750,6 @@ String callOpenAI() {
 
   lcdStatusLine("Querying OpenAI...");
   markActivity();
-  Serial.println("Connecting to OpenAI...");
-  Serial.println("---- Request Body ----");
-  Serial.println(body);
-  Serial.println("----------------------");
 
   String response = "";
 
@@ -1914,7 +1808,7 @@ String callOpenAI() {
 
       maybeUpdateLed();
       if (millis() - lastRead > 30000) {
-        Serial.println("OpenAI read timeout");
+        lcdStatusLine("OpenAI read timeout");
         break;
       }
       delay(10);
@@ -1922,17 +1816,12 @@ String callOpenAI() {
 
     httpsClient.stop();
     if (statusLine.length()) {
-      Serial.print("HTTP status: ");
-      Serial.print(statusLine);
+      lcdStatusLine("HTTP status: " + statusLine);
     }
   } else {
-    Serial.println("HTTPS connect FAIL");
     lcdStatusLine("OpenAI connect FAIL");
   }
 
-  Serial.println("---- Raw Response ----");
-  Serial.println(response);
-  Serial.println("----------------------");
   markActivity();
   ledExitBusy();
   return response;
@@ -2006,8 +1895,7 @@ String parseAssistantReply(const String& rawJson) {
   DynamicJsonDocument doc(16384);
   DeserializationError err = deserializeJson(doc, rawJson);
   if (err) {
-    Serial.print("JSON parse error: ");
-    Serial.println(err.c_str());
+    lcdStatusLine("JSON parse error: " + String(err.c_str()));
     return "[JSON parse error]";
   }
 
