@@ -158,6 +158,7 @@ bool ttsBusy = false;
 bool isMuted = false;
 uint8_t ttsVolume = 255;
 const int TTS_VOLUME_STEP = 16;
+const uint8_t UI_IDLE_DELAY_MS = 45;
 volatile bool ttsCancelRequested = false;
 TaskHandle_t ttsTaskHandle = nullptr;
 volatile bool ttsPrefetchPending = false;
@@ -1338,16 +1339,16 @@ void ttsWorkerTask(void* param) {
       size_t resumeOffset = ctx->startOffset;
       bool pausedPlayback = false;
       bool success = playTtsFromSD(audioPath, ctx->startOffset, resumeOffset, pausedPlayback);
-    if (pausedPlayback) {
-      ttsPaused = true;
-      ttsResumeOffset = resumeOffset;
-      ttsResumePath = audioPath;
-      postTtsStatus("Voice paused");
-      ttsPlaybackActive = false;
-    } else {
-      ttsPaused = false;
-      ttsResumeOffset = 0;
-      ttsResumePath = "";
+      if (pausedPlayback) {
+        ttsPaused = true;
+        ttsResumeOffset = resumeOffset;
+        ttsResumePath = audioPath;
+        postTtsStatus("Voice paused");
+        ttsPlaybackActive = false;
+      } else {
+        ttsPaused = false;
+        ttsResumeOffset = 0;
+        ttsResumePath = "";
         if (!success && !ttsCancelRequested) {
           postTtsStatus("Voice error");
         } else if (!ttsCancelRequested) {
@@ -1997,7 +1998,7 @@ String readSimpleTextLine(const String& statusMsg) {
     lcdStatusLine(statusMsg);
 
     prevHeld = currHeld;
-    delay(30);
+    delay(UI_IDLE_DELAY_MS);
   }
 }
 
@@ -2694,8 +2695,6 @@ void viewAssistantReplyInteractive() {
     maybeUpdateBatteryIndicator();
     checkDisplaySleep();
     pumpTtsStatus();
-    pumpTtsStatus();
-    pumpTtsStatus();
     auto ks = M5Cardputer.Keyboard.keysState();
     bool goNow = M5Cardputer.BtnA.isPressed();
     bool inputActive = hasKeyboardActivity(ks) || goNow;
@@ -2705,7 +2704,7 @@ void viewAssistantReplyInteractive() {
         prevHeld = ks.word;
         prevEnter = ks.enter;
         prevGo = goNow;
-        delay(60);
+        delay(UI_IDLE_DELAY_MS);
         continue;
       }
       if (manualSleepHold) {
@@ -2713,7 +2712,7 @@ void viewAssistantReplyInteractive() {
         prevHeld = ks.word;
         prevEnter = ks.enter;
         prevGo = goNow;
-        delay(60);
+        delay(UI_IDLE_DELAY_MS);
         continue;
       }
       wakeDisplayIfNeeded();
@@ -2728,6 +2727,12 @@ void viewAssistantReplyInteractive() {
     // -- EXIT on ENTER --
     if (ks.enter && !prevEnter) {
       markActivity();
+      if (ttsBusy && !ttsPlaybackActive) {
+        ttsCancelRequested = true;
+        ttsPauseRequested = false;
+        ttsPrefetchPending = false;
+        postTtsStatus("Voice cancelled");
+      }
       return;
     }
     prevEnter = ks.enter;
@@ -2847,7 +2852,7 @@ void viewAssistantReplyInteractive() {
     }
 
     prevHeld = currHeld;
-    delay(80);  // slow-ish poll so you don't overshoot instantly
+    delay(UI_IDLE_DELAY_MS);
   }
 }
 
@@ -2898,6 +2903,7 @@ String readPromptFromKeyboard() {
     maybeUpdateLed();
     maybeUpdateBatteryIndicator();
     checkDisplaySleep();
+    pumpTtsStatus();
     auto ks = M5Cardputer.Keyboard.keysState();
     bool goNow = M5Cardputer.BtnA.isPressed();
     bool backspaceNow = ks.del;
@@ -2909,7 +2915,7 @@ String readPromptFromKeyboard() {
         prevHeld = currHeld;
         prevGoButton = goNow;
         prevBackspace = backspaceNow;
-        delay(50);
+        delay(UI_IDLE_DELAY_MS);
         continue;
       }
       wakeDisplayIfNeeded();
@@ -2926,7 +2932,7 @@ String readPromptFromKeyboard() {
         prevGoButton = goNow;
         prevBackspace = backspaceNow;
         prevHeld = currHeld;
-        delay(30);
+        delay(UI_IDLE_DELAY_MS);
         continue;
       }
       voiceSampleCount = 0;
@@ -3123,7 +3129,7 @@ String readPromptFromKeyboard() {
 
     // 5. update edge-detect state
     prevHeld = currHeld;
-    delay(30);
+    delay(UI_IDLE_DELAY_MS);
   }
 }
 
