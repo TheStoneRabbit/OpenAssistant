@@ -29,6 +29,7 @@
 #include <ArduinoJson.h>
 #include <M5Cardputer.h>
 #include <vector>
+#include <queue>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -151,6 +152,8 @@ String ttsCachedPath = "";
 bool ttsAudioReady = false;
 bool ttsBusy = false;
 bool isMuted = false;
+uint8_t ttsVolume = 255;
+const int TTS_VOLUME_STEP = 16;
 
 // ------------------------------------------------------------
 // Utility: trim whitespace from both ends of String
@@ -173,6 +176,250 @@ String normalizeQuotes(const String& text) {
   t.replace("“", "\"");  // left double
   t.replace("”", "\"");  // right double
   return t;
+}
+
+static void appendSanitizedChar(String& out, char c, bool& lastWasSpace) {
+  out += c;
+  lastWasSpace = false;
+}
+
+String sanitizeForTts(const String& input) {
+  String sanitized;
+  sanitized.reserve(input.length());
+  bool lastWasSpace = true;  // treat start as if a space was already written
+
+  auto appendSpace = [&]() {
+    if (!lastWasSpace && sanitized.length() > 0) {
+      sanitized += ' ';
+      lastWasSpace = true;
+    }
+  };
+
+  auto appendChars = [&](const char* chars) {
+    while (*chars) {
+      appendSanitizedChar(sanitized, *chars, lastWasSpace);
+      ++chars;
+    }
+  };
+
+  auto handleFolded = [&](uint32_t codepoint) -> bool {
+    switch (codepoint) {
+      // Basic Latin letters with accents
+      case 0x00C0: case 0x00C1: case 0x00C2: case 0x00C3: case 0x00C4: case 0x00C5:
+      case 0x0100: case 0x0102: case 0x0104:
+        appendSanitizedChar(sanitized, 'A', lastWasSpace);
+        return true;
+      case 0x00E0: case 0x00E1: case 0x00E2: case 0x00E3: case 0x00E4: case 0x00E5:
+      case 0x0101: case 0x0103: case 0x0105:
+        appendSanitizedChar(sanitized, 'a', lastWasSpace);
+        return true;
+      case 0x00C7: case 0x0106: case 0x0108: case 0x010A: case 0x010C:
+        appendSanitizedChar(sanitized, 'C', lastWasSpace);
+        return true;
+      case 0x00E7: case 0x0107: case 0x0109: case 0x010B: case 0x010D:
+        appendSanitizedChar(sanitized, 'c', lastWasSpace);
+        return true;
+      case 0x00D0: case 0x010E: case 0x0110:
+        appendSanitizedChar(sanitized, 'D', lastWasSpace);
+        return true;
+      case 0x00F0: case 0x010F: case 0x0111:
+        appendSanitizedChar(sanitized, 'd', lastWasSpace);
+        return true;
+      case 0x00C8: case 0x00C9: case 0x00CA: case 0x00CB:
+      case 0x0112: case 0x0114: case 0x0116: case 0x0118: case 0x011A:
+        appendSanitizedChar(sanitized, 'E', lastWasSpace);
+        return true;
+      case 0x00E8: case 0x00E9: case 0x00EA: case 0x00EB:
+      case 0x0113: case 0x0115: case 0x0117: case 0x0119: case 0x011B:
+        appendSanitizedChar(sanitized, 'e', lastWasSpace);
+        return true;
+      case 0x00CC: case 0x00CD: case 0x00CE: case 0x00CF:
+      case 0x0128: case 0x012A: case 0x012C: case 0x012E: case 0x0130:
+        appendSanitizedChar(sanitized, 'I', lastWasSpace);
+        return true;
+      case 0x00EC: case 0x00ED: case 0x00EE: case 0x00EF:
+      case 0x0129: case 0x012B: case 0x012D: case 0x012F: case 0x0131:
+        appendSanitizedChar(sanitized, 'i', lastWasSpace);
+        return true;
+      case 0x0141:
+        appendSanitizedChar(sanitized, 'L', lastWasSpace);
+        return true;
+      case 0x0142:
+        appendSanitizedChar(sanitized, 'l', lastWasSpace);
+        return true;
+      case 0x00D1: case 0x0143: case 0x0145: case 0x0147:
+        appendSanitizedChar(sanitized, 'N', lastWasSpace);
+        return true;
+      case 0x00F1: case 0x0144: case 0x0146: case 0x0148: case 0x0149:
+        appendSanitizedChar(sanitized, 'n', lastWasSpace);
+        return true;
+      case 0x00D2: case 0x00D3: case 0x00D4: case 0x00D5: case 0x00D6: case 0x00D8:
+      case 0x014C: case 0x014E: case 0x0150:
+        appendSanitizedChar(sanitized, 'O', lastWasSpace);
+        return true;
+      case 0x00F2: case 0x00F3: case 0x00F4: case 0x00F5: case 0x00F6: case 0x00F8:
+      case 0x014D: case 0x014F: case 0x0151:
+        appendSanitizedChar(sanitized, 'o', lastWasSpace);
+        return true;
+      case 0x0152:
+        appendChars("OE");
+        return true;
+      case 0x0153:
+        appendChars("oe");
+        return true;
+      case 0x0154: case 0x0156: case 0x0158:
+        appendSanitizedChar(sanitized, 'R', lastWasSpace);
+        return true;
+      case 0x0155: case 0x0157: case 0x0159:
+        appendSanitizedChar(sanitized, 'r', lastWasSpace);
+        return true;
+      case 0x015A: case 0x015C: case 0x015E: case 0x0160:
+        appendSanitizedChar(sanitized, 'S', lastWasSpace);
+        return true;
+      case 0x015B: case 0x015D: case 0x015F: case 0x0161:
+        appendSanitizedChar(sanitized, 's', lastWasSpace);
+        return true;
+      case 0x0162: case 0x0164:
+        appendSanitizedChar(sanitized, 'T', lastWasSpace);
+        return true;
+      case 0x0163: case 0x0165:
+        appendSanitizedChar(sanitized, 't', lastWasSpace);
+        return true;
+      case 0x00D9: case 0x00DA: case 0x00DB: case 0x00DC:
+      case 0x0168: case 0x016A: case 0x016C: case 0x016E: case 0x0170: case 0x0172:
+        appendSanitizedChar(sanitized, 'U', lastWasSpace);
+        return true;
+      case 0x00F9: case 0x00FA: case 0x00FB: case 0x00FC:
+      case 0x0169: case 0x016B: case 0x016D: case 0x016F: case 0x0171: case 0x0173:
+        appendSanitizedChar(sanitized, 'u', lastWasSpace);
+        return true;
+      case 0x00DD: case 0x0178: case 0x0176:
+        appendSanitizedChar(sanitized, 'Y', lastWasSpace);
+        return true;
+      case 0x00FD: case 0x00FF: case 0x0177:
+        appendSanitizedChar(sanitized, 'y', lastWasSpace);
+        return true;
+      case 0x0179: case 0x017B: case 0x017D:
+        appendSanitizedChar(sanitized, 'Z', lastWasSpace);
+        return true;
+      case 0x017A: case 0x017C: case 0x017E:
+        appendSanitizedChar(sanitized, 'z', lastWasSpace);
+        return true;
+      case 0x00DF:
+        appendChars("ss");
+        return true;
+      case 0x011E:
+        appendSanitizedChar(sanitized, 'G', lastWasSpace);
+        return true;
+      case 0x011F:
+        appendSanitizedChar(sanitized, 'g', lastWasSpace);
+        return true;
+      case 0x0132:
+        appendChars("IJ");
+        return true;
+      case 0x0133:
+        appendChars("ij");
+        return true;
+      case 0x0134:
+        appendSanitizedChar(sanitized, 'J', lastWasSpace);
+        return true;
+      case 0x0135:
+        appendSanitizedChar(sanitized, 'j', lastWasSpace);
+        return true;
+      case 0x0136:
+        appendSanitizedChar(sanitized, 'K', lastWasSpace);
+        return true;
+      case 0x0137: case 0x0138:
+        appendSanitizedChar(sanitized, 'k', lastWasSpace);
+        return true;
+      case 0x0139: case 0x013B: case 0x013D:
+        appendSanitizedChar(sanitized, 'L', lastWasSpace);
+        return true;
+      case 0x013A: case 0x013C: case 0x013E:
+        appendSanitizedChar(sanitized, 'l', lastWasSpace);
+        return true;
+      default:
+        return false;
+    }
+  };
+
+  size_t len = input.length();
+  size_t i = 0;
+  while (i < len) {
+    uint8_t b = static_cast<uint8_t>(input[i]);
+    if (b < 0x80) {
+      char c = static_cast<char>(b);
+      if (c == '\r' || c == '\n' || c == '\t') {
+        appendSpace();
+      } else if (c == ' ') {
+        appendSpace();
+      } else if (c >= 0x20 && c <= 0x7E) {
+        appendSanitizedChar(sanitized, c, lastWasSpace);
+      } else {
+        appendSpace();
+      }
+      ++i;
+      continue;
+    }
+
+    uint32_t codepoint = 0;
+    size_t extraBytes = 0;
+    if ((b & 0xE0) == 0xC0 && (i + 1) < len) {
+      codepoint = ((uint32_t)(b & 0x1F) << 6) |
+                  (uint32_t)(static_cast<uint8_t>(input[i + 1]) & 0x3F);
+      extraBytes = 1;
+    } else if ((b & 0xF0) == 0xE0 && (i + 2) < len) {
+      codepoint = ((uint32_t)(b & 0x0F) << 12) |
+                  ((uint32_t)(static_cast<uint8_t>(input[i + 1]) & 0x3F) << 6) |
+                  (uint32_t)(static_cast<uint8_t>(input[i + 2]) & 0x3F);
+      extraBytes = 2;
+    } else if ((b & 0xF8) == 0xF0 && (i + 3) < len) {
+      codepoint = ((uint32_t)(b & 0x07) << 18) |
+                  ((uint32_t)(static_cast<uint8_t>(input[i + 1]) & 0x3F) << 12) |
+                  ((uint32_t)(static_cast<uint8_t>(input[i + 2]) & 0x3F) << 6) |
+                  (uint32_t)(static_cast<uint8_t>(input[i + 3]) & 0x3F);
+      extraBytes = 3;
+    } else {
+      appendSpace();
+      ++i;
+      continue;
+    }
+
+    i += extraBytes + 1;
+
+    if (handleFolded(codepoint)) {
+      continue;
+    }
+
+    if (codepoint == 0x00A0) {  // non-breaking space
+      appendSpace();
+      continue;
+    }
+    if (codepoint == 0x2013 || codepoint == 0x2014) {  // en/em dash
+      appendSanitizedChar(sanitized, '-', lastWasSpace);
+      continue;
+    }
+    if (codepoint == 0x2018 || codepoint == 0x2019 || codepoint == 0x02BC) {
+      appendSanitizedChar(sanitized, '\'', lastWasSpace);
+      continue;
+    }
+    if (codepoint == 0x201C || codepoint == 0x201D) {
+      appendSanitizedChar(sanitized, '"', lastWasSpace);
+      continue;
+    }
+    if (codepoint == 0x2026) {  // ellipsis
+      appendChars("...");
+      continue;
+    }
+
+    appendSpace();
+  }
+
+  sanitized.trim();
+  if (sanitized.length() == 0) {
+    return String("response unavailable");
+  }
+  return sanitized;
 }
 
 // ------------------------------------------------------------
@@ -600,6 +847,22 @@ bool downloadTtsAudio(const String& text, String& outPath) {
     lcdStatusLine("TTS: empty text");
     return false;
   }
+
+  String sanitizedText = sanitizeForTts(text);
+  if (sanitizedText != text) {
+    Serial.println("TTS: sanitized input to remove unsupported characters.");
+    Serial.println("  original: " + text);
+    Serial.println("  sanitized: " + sanitizedText);
+    String preview = sanitizedText;
+    preview.replace('\n', ' ');
+    preview.replace('\r', ' ');
+    preview.replace('\t', ' ');
+    if (preview.length() > 60) {
+      preview = preview.substring(0, 57) + "...";
+    }
+    lcdStatusLine("TTS sanitized*: " + preview);
+  }
+
   if (!mountSD()) {
     lcdStatusLine("TTS: SD mount failed");
     return false;
@@ -623,7 +886,7 @@ bool downloadTtsAudio(const String& text, String& outPath) {
   StaticJsonDocument<1024> doc;
   doc["model"] = TTS_MODEL_NAME;
   doc["voice"] = ttsVoice;
-  doc["input"] = text;
+  doc["input"] = sanitizedText;
   doc["response_format"] = "pcm";
 
   String body;
@@ -719,6 +982,29 @@ bool downloadTtsAudio(const String& text, String& outPath) {
   }
   if (statusCode != 200) {
     lcdStatusLine("TTS HTTP error: " + String(statusCode));
+    String errorPreview;
+    unsigned long errStart = millis();
+    while (httpsClient.available() && errorPreview.length() < 256) {
+      int c = httpsClient.read();
+      if (c < 0) {
+        if (millis() - errStart > TTS_DOWNLOAD_TIMEOUT_MS) {
+          break;
+        }
+        continue;
+      }
+      errorPreview += static_cast<char>(c);
+    }
+    if (errorPreview.length() > 0) {
+      Serial.println("TTS error preview: " + errorPreview);
+      String display = errorPreview;
+      display.replace('\r', ' ');
+      display.replace('\n', ' ');
+      display.trim();
+      if (display.length() > 60) {
+        display = display.substring(0, 57) + "...";
+      }
+      lcdStatusLine("TTS err detail: " + display);
+    }
     httpsClient.stop();
     audioFile.close();
     if (SD.exists(TTS_CACHE_PATH)) {
@@ -751,6 +1037,17 @@ bool downloadTtsAudio(const String& text, String& outPath) {
   return true;
 }
 
+void adjustTtsVolume(int delta) {
+  int newVol = (int)ttsVolume + delta;
+  if (newVol < 0) newVol = 0;
+  if (newVol > 255) newVol = 255;
+  ttsVolume = (uint8_t)newVol;
+  if (M5Cardputer.Speaker.isEnabled()) {
+    M5Cardputer.Speaker.setVolume(ttsVolume);
+  }
+  lcdStatusLine("TTS volume: " + String(ttsVolume));
+}
+
 bool playTtsFromSD(const String& path) {
   if (!mountSD()) {
     lcdStatusLine("TTS playback: SD mount failed");
@@ -770,80 +1067,162 @@ bool playTtsFromSD(const String& path) {
     return false;
   }
 
-  bool usedHeapCaps = true;
-  uint8_t* pcmData = (uint8_t*)heap_caps_malloc(fileSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!pcmData) {
-    usedHeapCaps = false;
-    pcmData = (uint8_t*)malloc(fileSize);
+  const size_t BUFFER_COUNT = 3;
+  const size_t CHUNK_BYTES_OPTIONS[] = { 16384, 12288, 8192, 4096 };
+
+  struct Buffer {
+    int16_t* data = nullptr;
+    bool usingHeapCaps = false;
+    bool inUse = false;
+  };
+  Buffer buffers[BUFFER_COUNT];
+  size_t chunkBytes = 0;
+
+  auto freeBuffers = [&]() {
+    for (size_t i = 0; i < BUFFER_COUNT; ++i) {
+      if (buffers[i].data) {
+        if (buffers[i].usingHeapCaps) {
+          heap_caps_free(buffers[i].data);
+        } else {
+          free(buffers[i].data);
+        }
+        buffers[i].data = nullptr;
+        buffers[i].usingHeapCaps = false;
+        buffers[i].inUse = false;
+      }
+    }
+  };
+
+  for (size_t option : CHUNK_BYTES_OPTIONS) {
+    bool allocated = true;
+    for (size_t i = 0; i < BUFFER_COUNT; ++i) {
+      int16_t* ptr = (int16_t*)heap_caps_malloc(option, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      bool usedHeap = true;
+      if (!ptr) {
+        ptr = (int16_t*)heap_caps_malloc(option, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      }
+      if (!ptr) {
+        ptr = (int16_t*)malloc(option);
+        usedHeap = false;
+      }
+      if (!ptr) {
+        allocated = false;
+        freeBuffers();
+        break;
+      }
+      buffers[i].data = ptr;
+      buffers[i].usingHeapCaps = usedHeap;
+      buffers[i].inUse = false;
+    }
+    if (allocated) {
+      chunkBytes = option;
+      break;
+    }
   }
-  if (!pcmData) {
+
+  if (chunkBytes == 0) {
     lcdStatusLine("TTS playback: alloc failed");
     f.close();
     unmountSD();
     return false;
   }
 
-  size_t readTotal = f.read(pcmData, fileSize);
-  f.close();
-  unmountSD();
-  if (readTotal != fileSize) {
-    lcdStatusLine("TTS playback: read mismatch. Exp: " + String(fileSize) + ", Got: " + String(readTotal));
-    if (usedHeapCaps) {
-      heap_caps_free(pcmData);
-    } else {
-      free(pcmData);
-    }
-    return false;
-  }
-  lcdStatusLine("TTS playback: Read " + String(fileSize) + " bytes.");
-
-  int16_t* samplePtr = reinterpret_cast<int16_t*>(pcmData);
-  size_t sampleCount = fileSize / sizeof(int16_t);
-  lcdStatusLine("TTS playback: Sample count: " + String(sampleCount));
+  std::queue<size_t> inFlightOrder;
+  size_t recordedInFlight = 0;
+  bool firstChunk = true;
+  bool fileDone = false;
+  unsigned long lastUpdate = millis();
 
   if (!M5Cardputer.Speaker.isEnabled()) {
     M5Cardputer.Speaker.begin();
   }
-  M5Cardputer.Speaker.setVolume(255);
+  M5Cardputer.Speaker.setVolume(ttsVolume);
   M5Cardputer.Speaker.stop();
 
-  bool ok = M5Cardputer.Speaker.playRaw(
-    samplePtr,
-    sampleCount,
-    TTS_DEFAULT_SAMPLE_RATE,
-    false, // stereo
-    1, // num_channels
-    -1, // i2s_port
-    true // free_data
-  );
-  if (!ok) {
-    lcdStatusLine("TTS playback: playRaw failed");
-    if (usedHeapCaps) {
-      heap_caps_free(pcmData);
-    } else {
-      free(pcmData);
+  auto findFreeBuffer = [&]() -> int {
+    for (size_t i = 0; i < BUFFER_COUNT; ++i) {
+      if (!buffers[i].inUse) {
+        return (int)i;
+      }
     }
-    return false;
-  }
+    return -1;
+  };
 
-  unsigned long lastUpdate = millis();
-  while (M5Cardputer.Speaker.isPlaying()) {
+  const int playbackChannel = 0;
+
+  while (true) {
+    size_t playingNow = M5Cardputer.Speaker.isPlaying(playbackChannel);
+    while (recordedInFlight > playingNow && !inFlightOrder.empty()) {
+      size_t freedIndex = inFlightOrder.front();
+      inFlightOrder.pop();
+      buffers[freedIndex].inUse = false;
+      recordedInFlight--;
+    }
+
+    if (!fileDone && recordedInFlight < BUFFER_COUNT) {
+      int bufferIndex = findFreeBuffer();
+      if (bufferIndex >= 0) {
+        size_t bytesRead = f.read((uint8_t*)buffers[bufferIndex].data, chunkBytes);
+        if (bytesRead == 0) {
+          fileDone = true;
+        } else {
+          if (bytesRead & 1) {
+            bytesRead -= 1;
+          }
+          size_t samples = bytesRead / sizeof(int16_t);
+          if (samples == 0) {
+            fileDone = true;
+          } else {
+            markActivity();
+            bool queued = M5Cardputer.Speaker.playRaw(
+              buffers[bufferIndex].data,
+              samples,
+              TTS_DEFAULT_SAMPLE_RATE,
+              false,
+              1,
+              playbackChannel,
+              firstChunk
+            );
+            if (!queued) {
+              lcdStatusLine("TTS playback: queue failed");
+              M5Cardputer.Speaker.stop();
+              freeBuffers();
+              f.close();
+              unmountSD();
+              return false;
+            }
+            firstChunk = false;
+            buffers[bufferIndex].inUse = true;
+            inFlightOrder.push(bufferIndex);
+            recordedInFlight++;
+            continue;
+          }
+        }
+      }
+    }
+
+    playingNow = M5Cardputer.Speaker.isPlaying(playbackChannel);
+    if (fileDone && recordedInFlight == 0 && playingNow == 0) {
+      break;
+    }
+
     M5Cardputer.update();
     maybeUpdateLed();
     maybeUpdateBatteryIndicator();
     checkDisplaySleep();
     markActivity();
-    delay(10);
-    if (millis() - lastUpdate > 20) {
+    delay(6);
+
+    if (millis() - lastUpdate > 50) {
       lastUpdate = millis();
     }
   }
+
+  f.close();
+  unmountSD();
   M5Cardputer.Speaker.stop();
-  if (usedHeapCaps) {
-    heap_caps_free(pcmData);
-  } else {
-    free(pcmData);
-  }
+
+  freeBuffers();
   return true;
 }
 
@@ -877,19 +1256,31 @@ void speakLastAssistantReply() {
   ledEnterBusy();
   markActivity();
 
-  bool useCache = ttsAudioReady && !ttsCachedPath.isEmpty() && lastAssistantReply == ttsCachedText;
+  String sanitizedReply = sanitizeForTts(lastAssistantReply);
+  Serial.println("TTS request text: " + sanitizedReply);
+  bool useCache = ttsAudioReady && !ttsCachedPath.isEmpty() && sanitizedReply == ttsCachedText;
   String audioPath = ttsCachedPath;
 
   if (!useCache) {
-    lcdStatusLine("TTS: fetching voice...");
+    String preview = sanitizedReply;
+    bool modified = sanitizedReply != lastAssistantReply;
+    preview.replace('\n', ' ');
+    preview.replace('\r', ' ');
+    preview.replace('\t', ' ');
+    if (preview.length() > 60) {
+      preview = preview.substring(0, 57) + "...";
+    }
+    String statusMsg = modified ? "TTS fetch*: " : "TTS fetch: ";
+    statusMsg += preview;
+    lcdStatusLine(statusMsg);
     markActivity();
-    if (!downloadTtsAudio(lastAssistantReply, audioPath)) {
+    if (!downloadTtsAudio(sanitizedReply, audioPath)) {
       lcdStatusLine("TTS fetch failed.");
       ledExitBusy();
       ttsBusy = false;
       return;
     }
-    ttsCachedText = lastAssistantReply;
+    ttsCachedText = sanitizedReply;
     ttsCachedPath = audioPath;
     ttsAudioReady = true;
   } else {
@@ -897,8 +1288,11 @@ void speakLastAssistantReply() {
   }
 
   markActivity();
+  String statusBeforePlayback = statusBaseLine;
   if (!playTtsFromSD(audioPath)) {
-    lcdStatusLine("TTS playback failed.");
+    if (statusBaseLine == statusBeforePlayback) {
+      lcdStatusLine("TTS playback failed.");
+    }
   } else {
     lcdStatusLine("TTS finished.");
   }
@@ -1946,13 +2340,17 @@ void typeReplyOverUSB(const String& text) {
 // - ENTER exits back to prompt mode
 // ------------------------------------------------------------
 void viewAssistantReplyInteractive() {
-  auto showAssistant = [&]() {
+  auto showAssistant = [&](bool updateStatus = true) {
     lcdShowAssistantReplyWindow();
-    lcdStatusLine(";/ up . down ,/ toggle v voice s sleep GO type ENTER exit");
+    if (updateStatus) {
+      lcdStatusLine(";/ up . down ,/ toggle v voice -/ vol=+/ s sleep GO type ENTER exit");
+    }
   };
-  auto showUser = [&]() {
+  auto showUser = [&](bool updateStatus = true) {
     lcdShowUserPromptView();
-    lcdStatusLine(",/ toggle v voice s sleep GO type AI ENTER exit");
+    if (updateStatus) {
+      lcdStatusLine(",/ toggle v voice -/ vol=+/ s sleep GO type AI ENTER exit");
+    }
   };
 
   bool showingAssistant = true;
@@ -2048,10 +2446,16 @@ void viewAssistantReplyInteractive() {
         } else if (c_now == 'v' || c_now == 'V') {
           speakLastAssistantReply();
           if (showingAssistant) {
-            showAssistant();
+            showAssistant(false);
           } else {
-            showUser();
+            showUser(false);
           }
+        } else if (c_now == '-' || c_now == '_') {
+          markActivity();
+          adjustTtsVolume(-TTS_VOLUME_STEP);
+        } else if (c_now == '=' || c_now == '+') {
+          markActivity();
+          adjustTtsVolume(TTS_VOLUME_STEP);
         } else if (c_now == 's' || c_now == 'S') {
           manualSleepHold = true;
           enterDisplaySleep();
