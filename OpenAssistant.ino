@@ -31,11 +31,15 @@
 #include <vector>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
+#include <memory>
+#include <new>
 #include <ctype.h>
 #include <algorithm>
 #include <SD.h>
 #include <SPI.h>
 #include "esp32-hal-rgb-led.h"
+#include "esp_heap_caps.h"
 
 // ---- USB HID keyboard (TinyUSB style on ESP32-S3) ----
 #include "USB.h"
@@ -53,8 +57,11 @@ const char* OPENAI_HOST = "api.openai.com";
 const int OPENAI_PORT = 443;
 const char* OPENAI_ENDPOINT = "/v1/responses";
 const char* OPENAI_TRANSCRIBE_ENDPOINT = "/v1/audio/transcriptions";
+const char* OPENAI_SPEECH_ENDPOINT = "/v1/audio/speech";
 const char* MODEL_NAME = "gpt-5-mini";
 const char* TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe";
+const char* TTS_MODEL_NAME = "gpt-4o-mini-tts";
+const char* DEFAULT_TTS_VOICE = "verse";
 const char* SYSTEM_PROMPT_TEXT =
   "You are a helpful assistant on a tiny handheld called the Cardputer. "
   "Keep answers short, clear, and friendly so they fit on the 320x240 screen.";
@@ -67,6 +74,8 @@ const size_t VOICE_MAX_SAMPLES = (VOICE_MAX_DURATION_MS / 1000) * VOICE_SAMPLE_R
 const char* VOICE_TEMP_DIR = "/oa_tmp";
 const char* VOICE_TEMP_PATH = "/oa_tmp/voice.raw";
 const char* TRANSCRIPT_DIR = "/transcripts";
+const char* TTS_CACHE_DIR = "/tts_cache";
+const char* TTS_CACHE_PATH = "/tts_cache/last.wav";
 
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 
@@ -88,6 +97,8 @@ const int REPLY_AREA_Y = PROMPT_AREA_Y;
 
 const uint32_t INACTIVITY_TIMEOUT_MS = 60000;
 const uint32_t BATTERY_UPDATE_INTERVAL_MS = 60000;
+const uint32_t TTS_DOWNLOAD_TIMEOUT_MS = 30000;
+const uint32_t TTS_DEFAULT_SAMPLE_RATE = 24000;
 
 // ---------- GLOBALS ----------
 
@@ -132,6 +143,13 @@ bool ledAvailable = false;
 bool ledBlinkState = false;
 unsigned long lastLedToggleMs = 0;
 int ledBusyDepth = 0;
+
+// TTS cache state
+String ttsVoice = DEFAULT_TTS_VOICE;
+String ttsCachedText = "";
+String ttsCachedPath = "";
+bool ttsAudioReady = false;
+bool ttsBusy = false;
 
 // ------------------------------------------------------------
 // Utility: trim whitespace from both ends of String
@@ -463,6 +481,522 @@ String transcribeVoiceFile(size_t sampleCount) {
 }
 
 // ------------------------------------------------------------
+// Text-to-Speech helpers (GPT voice via OpenAI API)
+// ------------------------------------------------------------
+static inline uint16_t readLE16(const uint8_t* src) {
+  return (uint16_t)(src[0] | (src[1] << 8));
+}
+
+static inline uint32_t readLE32(const uint8_t* src) {
+  return (uint32_t)src[0]
+       | ((uint32_t)src[1] << 8)
+       | ((uint32_t)src[2] << 16)
+       | ((uint32_t)src[3] << 24);
+}
+
+static bool readLineFromClient(WiFiClientSecure& client, String& line, unsigned long timeoutMs) {
+  line = "";
+  unsigned long start = millis();
+  while (true) {
+    while (client.available()) {
+      char c = client.read();
+      if (c == '\r') {
+        start = millis();
+        continue;
+      }
+      if (c == '\n') {
+        return true;
+      }
+      line += c;
+      start = millis();
+    }
+    if (millis() - start > timeoutMs) {
+      return !line.isEmpty();
+    }
+    if (!client.connected()) {
+      return !line.isEmpty();
+    }
+    delay(5);
+  }
+}
+
+static bool readFixedBodyToFile(WiFiClientSecure& client, File& file, long contentLength) {
+  const size_t BUF_SIZE = 1024;
+  uint8_t buffer[BUF_SIZE];
+  unsigned long lastData = millis();
+  bool lengthKnown = contentLength >= 0;
+
+  while (client.connected() || client.available()) {
+    if (lengthKnown && contentLength <= 0) {
+      return true;
+    }
+    if (!client.available()) {
+      if (millis() - lastData > TTS_DOWNLOAD_TIMEOUT_MS) {
+        return false;
+      }
+      delay(5);
+      continue;
+    }
+
+    size_t toRead = lengthKnown
+      ? (size_t)std::min<long>(contentLength, (long)BUF_SIZE)
+      : BUF_SIZE;
+
+    int readLen = client.read(buffer, toRead);
+    if (readLen <= 0) {
+      break;
+    }
+    file.write(buffer, readLen);
+    markActivity();
+    lastData = millis();
+    if (lengthKnown) {
+      contentLength -= readLen;
+    }
+  }
+  return !lengthKnown || contentLength <= 0;
+}
+
+static bool readChunkedBodyToFile(WiFiClientSecure& client, File& file) {
+  const size_t BUF_SIZE = 1024;
+  uint8_t buffer[BUF_SIZE];
+
+  while (true) {
+    String sizeLine;
+    if (!readLineFromClient(client, sizeLine, TTS_DOWNLOAD_TIMEOUT_MS)) {
+      return false;
+    }
+    sizeLine.trim();
+    if (sizeLine.length() == 0) {
+      continue;
+    }
+
+    long chunkSize = strtol(sizeLine.c_str(), nullptr, 16);
+    if (chunkSize <= 0) {
+      // consume trailer (possibly empty line)
+      String trailer;
+      readLineFromClient(client, trailer, TTS_DOWNLOAD_TIMEOUT_MS);
+      return true;
+    }
+
+    long remaining = chunkSize;
+    unsigned long lastData = millis();
+    while (remaining > 0) {
+      if (!client.available()) {
+        if (millis() - lastData > TTS_DOWNLOAD_TIMEOUT_MS) {
+          return false;
+        }
+        if (!client.connected()) {
+          return false;
+        }
+        delay(5);
+        continue;
+      }
+      size_t toRead = (remaining < (long)BUF_SIZE) ? remaining : BUF_SIZE;
+      int len = client.read(buffer, toRead);
+      if (len <= 0) {
+        return false;
+      }
+      file.write(buffer, len);
+      markActivity();
+      remaining -= len;
+      lastData = millis();
+    }
+
+    // Discard CRLF after chunk
+    for (int i = 0; i < 2; ++i) {
+      unsigned long start = millis();
+      while (!client.available()) {
+        if (millis() - start > TTS_DOWNLOAD_TIMEOUT_MS) {
+          return false;
+        }
+        if (!client.connected()) {
+          return false;
+        }
+        delay(2);
+      }
+      client.read();
+    }
+  }
+}
+
+bool downloadTtsAudio(const String& text, String& outPath) {
+  if (OPENAI_API_KEY.isEmpty()) {
+    Serial.println("TTS requires OPENAI_KEY");
+    return false;
+  }
+  if (text.isEmpty()) {
+    Serial.println("TTS: empty text");
+    return false;
+  }
+  if (!mountSD()) {
+    Serial.println("TTS: SD mount failed");
+    return false;
+  }
+  if (!ensureDirectory(TTS_CACHE_DIR)) {
+    Serial.println("TTS: cache dir ensure failed");
+    unmountSD();
+    return false;
+  }
+
+  if (SD.exists(TTS_CACHE_PATH)) {
+    SD.remove(TTS_CACHE_PATH);
+  }
+  File audioFile = SD.open(TTS_CACHE_PATH, FILE_WRITE);
+  if (!audioFile) {
+    Serial.println("TTS: cache file open failed");
+    unmountSD();
+    return false;
+  }
+
+  StaticJsonDocument<1024> doc;
+  doc["model"] = TTS_MODEL_NAME;
+  doc["voice"] = ttsVoice;
+  doc["input"] = text;
+  doc["format"] = "wav";
+
+  String body;
+  serializeJson(doc, body);
+
+  httpsClient.stop();
+  httpsClient.setInsecure();
+  httpsClient.setTimeout(15000);
+
+  if (!httpsClient.connect(OPENAI_HOST, OPENAI_PORT)) {
+    Serial.println("TTS HTTPS connect FAIL");
+    audioFile.close();
+    unmountSD();
+    return false;
+  }
+
+  String req;
+  req.reserve(body.length() + 256);
+  req += "POST ";
+  req += OPENAI_SPEECH_ENDPOINT;
+  req += " HTTP/1.1\r\n";
+  req += "Host: ";
+  req += OPENAI_HOST;
+  req += "\r\n";
+  req += "Authorization: Bearer ";
+  req += OPENAI_API_KEY;
+  req += "\r\n";
+  req += "Content-Type: application/json\r\n";
+  req += "Accept: audio/wav\r\n";
+  req += "Connection: close\r\n";
+  req += "Content-Length: ";
+  req += String(body.length());
+  req += "\r\n\r\n";
+  req += body;
+
+  httpsClient.print(req);
+
+  bool headersFinished = false;
+  bool chunked = false;
+  long contentLength = -1;
+  String statusLine = "";
+  String headerLine = "";
+  unsigned long lastRead = millis();
+
+  while (!headersFinished && (httpsClient.connected() || httpsClient.available())) {
+    while (httpsClient.available() && !headersFinished) {
+      char c = httpsClient.read();
+      lastRead = millis();
+      headerLine += c;
+      if (c == '\n') {
+        if (statusLine.length() == 0) {
+          statusLine = headerLine;
+        }
+        String trimmed = headerLine;
+        trimmed.trim();
+        String lowered = trimmed;
+        lowered.toLowerCase();
+        if (lowered.startsWith("transfer-encoding:")) {
+          if (lowered.indexOf("chunked") >= 0) {
+            chunked = true;
+          }
+        } else if (lowered.startsWith("content-length:")) {
+          contentLength = trimmed.substring(trimmed.indexOf(':') + 1).toInt();
+        }
+        if (headerLine == "\r\n") {
+          headersFinished = true;
+        }
+        headerLine = "";
+      }
+    }
+    if (!headersFinished) {
+      if (millis() - lastRead > TTS_DOWNLOAD_TIMEOUT_MS) {
+        Serial.println("TTS header timeout");
+        httpsClient.stop();
+        audioFile.close();
+        unmountSD();
+        return false;
+      }
+      delay(2);
+    }
+  }
+
+  int statusCode = 0;
+  int spaceIdx = statusLine.indexOf(' ');
+  if (spaceIdx > 0) {
+    int spaceIdx2 = statusLine.indexOf(' ', spaceIdx + 1);
+    if (spaceIdx2 > spaceIdx) {
+      statusCode = statusLine.substring(spaceIdx + 1, spaceIdx2).toInt();
+    }
+  }
+  if (statusCode != 200) {
+    Serial.print("TTS HTTP error: ");
+    Serial.println(statusCode);
+    httpsClient.stop();
+    audioFile.close();
+    if (SD.exists(TTS_CACHE_PATH)) {
+      SD.remove(TTS_CACHE_PATH);
+    }
+    unmountSD();
+    return false;
+  }
+
+  bool ok = chunked
+          ? readChunkedBodyToFile(httpsClient, audioFile)
+          : readFixedBodyToFile(httpsClient, audioFile, contentLength);
+
+  httpsClient.stop();
+  audioFile.flush();
+  audioFile.close();
+
+  if (!ok) {
+    Serial.println("TTS: body read failed");
+    if (SD.exists(TTS_CACHE_PATH)) {
+      SD.remove(TTS_CACHE_PATH);
+    }
+    unmountSD();
+    return false;
+  }
+
+  outPath = String(TTS_CACHE_PATH);
+  unmountSD();
+  return true;
+}
+
+bool playTtsFromSD(const String& path) {
+  if (!mountSD()) {
+    Serial.println("TTS playback: SD mount failed");
+    return false;
+  }
+  File f = SD.open(path, FILE_READ);
+  if (!f) {
+    Serial.println("TTS playback: file open failed");
+    unmountSD();
+    return false;
+  }
+  size_t fileSize = f.size();
+  if (f.size() < 44) {
+    Serial.println("TTS playback: file too small");
+    f.close();
+    unmountSD();
+    return false;
+  }
+
+  bool usedHeapCaps = true;
+  uint8_t* wavData = (uint8_t*)heap_caps_malloc(fileSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!wavData) {
+    usedHeapCaps = false;
+    wavData = (uint8_t*)malloc(fileSize);
+  }
+  if (!wavData) {
+    Serial.println("TTS playback: alloc failed");
+    f.close();
+    unmountSD();
+    return false;
+  }
+
+  size_t readTotal = f.read(wavData, fileSize);
+  f.close();
+  unmountSD();
+  if (readTotal != fileSize) {
+    Serial.println("TTS playback: read mismatch");
+    if (usedHeapCaps) {
+      heap_caps_free(wavData);
+    } else {
+      free(wavData);
+    }
+    return false;
+  }
+  if (memcmp(wavData, "RIFF", 4) != 0 || memcmp(wavData + 8, "WAVE", 4) != 0) {
+    Serial.println("TTS playback: invalid header");
+    if (usedHeapCaps) {
+      heap_caps_free(wavData);
+    } else {
+      free(wavData);
+    }
+    return false;
+  }
+
+  uint32_t sampleRate = TTS_DEFAULT_SAMPLE_RATE;
+  uint16_t channels = 1;
+  uint16_t bitsPerSample = 16;
+  bool fmtFound = false;
+  bool dataFound = false;
+  size_t dataOffset = 0;
+  uint32_t dataSize = 0;
+
+  size_t pos = 12;
+  while (pos + 8 <= fileSize) {
+    uint8_t* chunk = wavData + pos;
+    uint32_t chunkSize = readLE32(chunk + 4);
+    size_t chunkDataPos = pos + 8;
+    if (chunkDataPos + chunkSize > fileSize) {
+      break;
+    }
+
+    if (memcmp(chunk, "fmt ", 4) == 0) {
+      if (chunkSize >= 16) {
+        fmtFound = true;
+        uint16_t audioFormat = readLE16(wavData + chunkDataPos);
+        channels = readLE16(wavData + chunkDataPos + 2);
+        sampleRate = readLE32(wavData + chunkDataPos + 4);
+        bitsPerSample = readLE16(wavData + chunkDataPos + 14);
+        if (audioFormat != 1) {
+          Serial.println("TTS playback: unsupported format");
+          break;
+        }
+      }
+    } else if (memcmp(chunk, "data", 4) == 0) {
+      dataOffset = chunkDataPos;
+      dataSize = chunkSize;
+      dataFound = true;
+      break;
+    }
+
+    size_t advance = 8 + chunkSize;
+    if (advance & 1) advance++;
+    pos += advance;
+  }
+
+  if (!fmtFound || !dataFound || bitsPerSample != 16 || (channels != 1 && channels != 2)) {
+    Serial.println("TTS playback: unsupported wav");
+    if (usedHeapCaps) {
+      heap_caps_free(wavData);
+    } else {
+      free(wavData);
+    }
+    return false;
+  }
+  if (dataOffset + dataSize > fileSize || dataSize == 0) {
+    Serial.println("TTS playback: invalid data region");
+    if (usedHeapCaps) {
+      heap_caps_free(wavData);
+    } else {
+      free(wavData);
+    }
+    return false;
+  }
+
+  int16_t* samplePtr = reinterpret_cast<int16_t*>(wavData + dataOffset);
+  size_t sampleCount = dataSize / sizeof(int16_t);
+  bool stereo = (channels == 2);
+
+  if (!M5Cardputer.Speaker.isEnabled()) {
+    M5Cardputer.Speaker.begin();
+  }
+  M5Cardputer.Speaker.setVolume(255);
+  M5Cardputer.Speaker.stop();
+
+  bool ok = M5Cardputer.Speaker.playRaw(
+    samplePtr,
+    sampleCount,
+    sampleRate,
+    stereo,
+    1,
+    -1,
+    true
+  );
+  if (!ok) {
+    Serial.println("TTS playback: playRaw failed");
+    if (usedHeapCaps) {
+      heap_caps_free(wavData);
+    } else {
+      free(wavData);
+    }
+    return false;
+  }
+
+  unsigned long lastUpdate = millis();
+  while (M5Cardputer.Speaker.isPlaying()) {
+    M5Cardputer.update();
+    maybeUpdateLed();
+    maybeUpdateBatteryIndicator();
+    checkDisplaySleep();
+    markActivity();
+    delay(10);
+    if (millis() - lastUpdate > 20) {
+      lastUpdate = millis();
+    }
+  }
+  M5Cardputer.Speaker.stop();
+  if (usedHeapCaps) {
+    heap_caps_free(wavData);
+  } else {
+    free(wavData);
+  }
+  return true;
+}
+
+void clearTtsCache() {
+  ttsAudioReady = false;
+  ttsCachedText = "";
+  ttsCachedPath = "";
+  if (mountSD()) {
+    if (SD.exists(TTS_CACHE_PATH)) {
+      SD.remove(TTS_CACHE_PATH);
+    }
+    unmountSD();
+  }
+}
+
+void speakLastAssistantReply() {
+  if (ttsBusy) {
+    lcdStatusLine("TTS busy...");
+    return;
+  }
+  if (lastAssistantReply.isEmpty()) {
+    lcdStatusLine("TTS: nothing to say.");
+    return;
+  }
+
+  ttsBusy = true;
+  ledEnterBusy();
+  markActivity();
+
+  bool useCache = ttsAudioReady && !ttsCachedPath.isEmpty() && lastAssistantReply == ttsCachedText;
+  String audioPath = ttsCachedPath;
+
+  if (!useCache) {
+    lcdStatusLine("TTS: fetching voice...");
+    markActivity();
+    if (!downloadTtsAudio(lastAssistantReply, audioPath)) {
+      lcdStatusLine("TTS fetch failed.");
+      ledExitBusy();
+      ttsBusy = false;
+      return;
+    }
+    ttsCachedText = lastAssistantReply;
+    ttsCachedPath = audioPath;
+    ttsAudioReady = true;
+  } else {
+    lcdStatusLine("TTS: playing cached audio...");
+  }
+
+  markActivity();
+  if (!playTtsFromSD(audioPath)) {
+    lcdStatusLine("TTS playback failed.");
+  } else {
+    lcdStatusLine("TTS finished.");
+  }
+
+  ledExitBusy();
+  ttsBusy = false;
+}
+
+// ------------------------------------------------------------
 // Load config from SD card (/chat_config.txt)
 // ------------------------------------------------------------
 bool loadConfigFromSD() {
@@ -507,6 +1041,10 @@ bool loadConfigFromSD() {
     } else if (key == "OPENAI_KEY") {
       OPENAI_API_KEY = value;
       Serial.println("KEY: (loaded)");
+    } else if (key == "TTS_VOICE") {
+      ttsVoice = value;
+      Serial.print("TTS voice: ");
+      Serial.println(ttsVoice);
     }
   }
 
@@ -599,6 +1137,10 @@ void updateHeaderBattery(bool force) {
 void renderStatusLineInner(bool force);
 void renderStatusLine(bool force);
 void setLedColor(uint8_t r, uint8_t g, uint8_t b);
+void clearTtsCache();
+bool downloadTtsAudio(const String& text, String& outPath);
+bool playTtsFromSD(const String& path);
+void speakLastAssistantReply();
 
 void maybeUpdateBatteryIndicator() {
   renderStatusLineInner(false);
@@ -921,6 +1463,10 @@ bool writeConfigToSD() {
   f.println(WIFI_PASS);
   f.print("OPENAI_KEY = ");
   f.println(OPENAI_API_KEY);
+  if (!ttsVoice.isEmpty()) {
+    f.print("TTS_VOICE = ");
+    f.println(ttsVoice);
+  }
   f.close();
   unmountSD();
   return true;
@@ -1514,11 +2060,11 @@ void typeReplyOverUSB(const String& text) {
 void viewAssistantReplyInteractive() {
   auto showAssistant = [&]() {
     lcdShowAssistantReplyWindow();
-    lcdStatusLine(";/ up . down ,/ toggle s sleep GO type ENTER exit");
+    lcdStatusLine(";/ up . down ,/ toggle v voice s sleep GO type ENTER exit");
   };
   auto showUser = [&]() {
     lcdShowUserPromptView();
-    lcdStatusLine(",/ toggle s sleep GO type AI ENTER exit");
+    lcdStatusLine(",/ toggle v voice s sleep GO type AI ENTER exit");
   };
 
   bool showingAssistant = true;
@@ -1611,6 +2157,13 @@ void viewAssistantReplyInteractive() {
             showUser();
           }
           markActivity();
+        } else if (c_now == 'v' || c_now == 'V') {
+          speakLastAssistantReply();
+          if (showingAssistant) {
+            showAssistant();
+          } else {
+            showUser();
+          }
         } else if (c_now == 's' || c_now == 'S') {
           manualSleepHold = true;
           enterDisplaySleep();
@@ -1643,6 +2196,7 @@ void viewAssistantReplyInteractive() {
 // - ENTER submits
 // ------------------------------------------------------------
 String readPromptFromKeyboard() {
+  clearTtsCache();
   inputBuffer = "";
   lcdShowPromptEditing(inputBuffer);
   lcdStatusLine("Type. ENTER=send");
@@ -2016,6 +2570,9 @@ void loop() {
   // 5. Save reply to chat history + remember it for GO typing
   addMessageToHistory("assistant", reply);
   lastAssistantReply = reply;
+  ttsAudioReady = false;
+  ttsCachedText = "";
+  ttsCachedPath = "";
 
   // 6. Prepare wrapped lines for scrolling UI
   prepareReplyLinesFromText(reply);
