@@ -49,44 +49,44 @@ String WIFI_SSID = "";
 String WIFI_PASS = "";
 String OPENAI_API_KEY = "";
 
-const char* OPENAI_HOST     = "api.openai.com";
-const int   OPENAI_PORT     = 443;
+const char* OPENAI_HOST = "api.openai.com";
+const int OPENAI_PORT = 443;
 const char* OPENAI_ENDPOINT = "/v1/responses";
 const char* OPENAI_TRANSCRIBE_ENDPOINT = "/v1/audio/transcriptions";
-const char* MODEL_NAME       = "gpt-5-mini";
+const char* MODEL_NAME = "gpt-5-mini";
 const char* TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe";
 const char* SYSTEM_PROMPT_TEXT =
   "You are a helpful assistant on a tiny handheld called the Cardputer. "
   "Keep answers short, clear, and friendly so they fit on the 320x240 screen.";
 
 // Voice recording configuration
-const uint32_t VOICE_SAMPLE_RATE     = 16000;
-const size_t   VOICE_CHUNK_SAMPLES   = 256;
+const uint32_t VOICE_SAMPLE_RATE = 16000;
+const size_t VOICE_CHUNK_SAMPLES = 256;
 const uint32_t VOICE_MAX_DURATION_MS = 6000;
-const size_t   VOICE_MAX_SAMPLES     = (VOICE_MAX_DURATION_MS / 1000) * VOICE_SAMPLE_RATE;
-const char*    VOICE_TEMP_DIR        = "/oa_tmp";
-const char*    VOICE_TEMP_PATH       = "/oa_tmp/voice.raw";
-const char*    TRANSCRIPT_DIR        = "/transcripts";
+const size_t VOICE_MAX_SAMPLES = (VOICE_MAX_DURATION_MS / 1000) * VOICE_SAMPLE_RATE;
+const char* VOICE_TEMP_DIR = "/oa_tmp";
+const char* VOICE_TEMP_PATH = "/oa_tmp/voice.raw";
+const char* TRANSCRIPT_DIR = "/transcripts";
 
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 
-const int SCREEN_WIDTH       = 240;
-const int SCREEN_HEIGHT      = 135;
-const int HEADER_TEXT_SIZE   = 2;
-const int STATUS_TEXT_SIZE   = 2;
-const int CONTENT_TEXT_SIZE  = 2;
-const int PROMPT_TEXT_SIZE   = CONTENT_TEXT_SIZE;
-const int REPLY_TEXT_SIZE    = CONTENT_TEXT_SIZE;
-const int HEADER_HEIGHT      = HEADER_TEXT_SIZE * 12 + 8;
-const int STATUS_HEIGHT      = STATUS_TEXT_SIZE * 12 + 6;
-const int CONTENT_MARGIN_X   = 8;
-const int CONTENT_MARGIN_Y   = 4;
+const int SCREEN_WIDTH = 240;
+const int SCREEN_HEIGHT = 135;
+const int HEADER_TEXT_SIZE = 2;
+const int STATUS_TEXT_SIZE = 2;
+const int CONTENT_TEXT_SIZE = 2;
+const int PROMPT_TEXT_SIZE = CONTENT_TEXT_SIZE;
+const int REPLY_TEXT_SIZE = CONTENT_TEXT_SIZE;
+const int HEADER_HEIGHT = HEADER_TEXT_SIZE * 12 + 8;
+const int STATUS_HEIGHT = STATUS_TEXT_SIZE * 12 + 6;
+const int CONTENT_MARGIN_X = 8;
+const int CONTENT_MARGIN_Y = 4;
 const int CONTENT_LINE_EXTRA = 6;
-const int PROMPT_AREA_Y      = HEADER_HEIGHT + STATUS_HEIGHT + CONTENT_MARGIN_Y;
+const int PROMPT_AREA_Y = HEADER_HEIGHT + STATUS_HEIGHT + CONTENT_MARGIN_Y;
 const int PROMPT_AREA_HEIGHT = SCREEN_HEIGHT > PROMPT_AREA_Y ? SCREEN_HEIGHT - PROMPT_AREA_Y : 0;
-const int REPLY_AREA_Y       = PROMPT_AREA_Y;
+const int REPLY_AREA_Y = PROMPT_AREA_Y;
 
-const uint32_t INACTIVITY_TIMEOUT_MS      = 60000;
+const uint32_t INACTIVITY_TIMEOUT_MS = 60000;
 const uint32_t BATTERY_UPDATE_INTERVAL_MS = 60000;
 
 // ---------- GLOBALS ----------
@@ -97,7 +97,7 @@ String lastUserPrompt = "";
 
 // Conversation memory
 struct ChatMessage {
-  String role;    // "system", "user", "assistant"
+  String role;  // "system", "user", "assistant"
   String content;
 };
 std::vector<ChatMessage> chatHistory;
@@ -149,10 +149,10 @@ String trimBoth(const String& s) {
 
 String normalizeQuotes(const String& text) {
   String t = text;
-  t.replace("’", "'");  // right single quote
-  t.replace("‘", "'");  // left single quote
-  t.replace("“", "\""); // left double
-  t.replace("”", "\""); // right double
+  t.replace("’", "'");   // right single quote
+  t.replace("‘", "'");   // left single quote
+  t.replace("“", "\"");  // left double
+  t.replace("”", "\"");  // right double
   return t;
 }
 
@@ -173,19 +173,31 @@ static inline void writeLE32(uint8_t* dst, uint32_t value) {
 
 static void fillWavHeader(uint8_t* header, size_t sampleCount, uint32_t sampleRate) {
   size_t pcmBytes = sampleCount * sizeof(int16_t);
-  header[0] = 'R'; header[1] = 'I'; header[2] = 'F'; header[3] = 'F';
+  header[0] = 'R';
+  header[1] = 'I';
+  header[2] = 'F';
+  header[3] = 'F';
   writeLE32(header + 4, pcmBytes + 36);
-  header[8]  = 'W'; header[9]  = 'A'; header[10] = 'V'; header[11] = 'E';
-  header[12] = 'f'; header[13] = 'm'; header[14] = 't'; header[15] = ' ';
-  writeLE32(header + 16, 16);   // Subchunk1Size
-  writeLE16(header + 20, 1);    // PCM
-  writeLE16(header + 22, 1);    // Mono
+  header[8] = 'W';
+  header[9] = 'A';
+  header[10] = 'V';
+  header[11] = 'E';
+  header[12] = 'f';
+  header[13] = 'm';
+  header[14] = 't';
+  header[15] = ' ';
+  writeLE32(header + 16, 16);  // Subchunk1Size
+  writeLE16(header + 20, 1);   // PCM
+  writeLE16(header + 22, 1);   // Mono
   writeLE32(header + 24, sampleRate);
-  uint32_t byteRate = sampleRate * 2; // mono, 16-bit
+  uint32_t byteRate = sampleRate * 2;  // mono, 16-bit
   writeLE32(header + 28, byteRate);
-  writeLE16(header + 32, 2);    // block align
-  writeLE16(header + 34, 16);   // bits per sample
-  header[36] = 'd'; header[37] = 'a'; header[38] = 't'; header[39] = 'a';
+  writeLE16(header + 32, 2);   // block align
+  writeLE16(header + 34, 16);  // bits per sample
+  header[36] = 'd';
+  header[37] = 'a';
+  header[38] = 't';
+  header[39] = 'a';
   writeLE32(header + 40, pcmBytes);
 }
 
@@ -331,11 +343,11 @@ String requestTranscriptionFromSD(size_t sampleCount) {
   String closing = "\r\n--" + boundary + "--\r\n";
 
   size_t contentLength = partModel.length()
-                       + partFormat.length()
-                       + partAudioHeader.length()
-                       + wavHeaderSize
-                       + pcmBytes
-                       + closing.length();
+                         + partFormat.length()
+                         + partAudioHeader.length()
+                         + wavHeaderSize
+                         + pcmBytes
+                         + closing.length();
 
   httpsClient.stop();
   httpsClient.setInsecure();
@@ -522,8 +534,7 @@ void addMessageToHistory(const String& role, const String& text) {
   if (chatHistory.size() > 8) {
     chatHistory.erase(
       chatHistory.begin(),
-      chatHistory.begin() + (chatHistory.size() - 8)
-    );
+      chatHistory.begin() + (chatHistory.size() - 8));
   }
 }
 
@@ -587,6 +598,7 @@ void updateHeaderBattery(bool force) {
 
 void renderStatusLineInner(bool force);
 void renderStatusLine(bool force);
+void setLedColor(uint8_t r, uint8_t g, uint8_t b);
 
 void maybeUpdateBatteryIndicator() {
   renderStatusLineInner(false);
@@ -594,6 +606,18 @@ void maybeUpdateBatteryIndicator() {
 
 void markActivity() {
   lastActivityMs = millis();
+}
+
+void enterDisplaySleep() {
+  if (displaySleeping) {
+    return;
+  }
+  displaySleeping = true;
+  M5Cardputer.Display.sleep();
+  if (ledAvailable) {
+    setLedColor(0, 0, 0);
+    ledBlinkState = false;
+  }
 }
 
 bool wakeDisplayIfNeeded() {
@@ -616,12 +640,7 @@ void checkDisplaySleep() {
   if (displaySleeping) return;
   unsigned long now = millis();
   if (now - lastActivityMs >= INACTIVITY_TIMEOUT_MS) {
-    displaySleeping = true;
-    M5Cardputer.Display.sleep();
-    if (ledAvailable) {
-      setLedColor(0, 0, 0);
-      ledBlinkState = false;
-    }
+    enterDisplaySleep();
   }
 }
 
@@ -708,7 +727,7 @@ bool stringIsDigits(const String& s) {
   return true;
 }
 
-template <typename KeyState>
+template<typename KeyState>
 bool hasKeyboardActivity(const KeyState& ks) {
   return ks.enter || ks.del || !ks.word.empty();
 }
@@ -1186,8 +1205,8 @@ bool wifiInteractiveSetup() {
     bool haveExisting = (chosenSsid == WIFI_SSID) && !WIFI_PASS.isEmpty();
     while (true) {
       String prompt = haveExisting
-        ? "Password (blank=keep current /cancel)"
-        : "Enter WiFi password (/cancel)";
+                        ? "Password (blank=keep current /cancel)"
+                        : "Enter WiFi password (/cancel)";
       String entry = readSimpleTextLine(prompt);
       if (entry.equalsIgnoreCase("/cancel")) {
         lcdStatusLine("WiFi setup cancelled.");
@@ -1249,7 +1268,7 @@ bool wifiInteractiveSetup() {
 }
 
 void initHTTPS() {
-  httpsClient.setInsecure();    // no cert validation (dev mode)
+  httpsClient.setInsecure();  // no cert validation (dev mode)
   httpsClient.setTimeout(15000);
 }
 
@@ -1268,7 +1287,7 @@ String buildRequestBody() {
   JsonArray inputArr = doc.createNestedArray("input");
   for (size_t i = 0; i < chatHistory.size(); i++) {
     JsonObject m = inputArr.createNestedObject();
-    m["role"]    = chatHistory[i].role;
+    m["role"] = chatHistory[i].role;
     m["content"] = chatHistory[i].content;
   }
 
@@ -1423,8 +1442,7 @@ void collectResponseText(JsonVariantConst node, String& out) {
       if (strcmp(key, "type") == 0 || strcmp(key, "role") == 0 || strcmp(key, "id") == 0 || strcmp(key, "index") == 0) {
         continue;
       }
-      if (strcmp(key, "text") == 0 || strcmp(key, "value") == 0 || strcmp(key, "content") == 0 ||
-          strcmp(key, "output_text") == 0 || strcmp(key, "delta") == 0) {
+      if (strcmp(key, "text") == 0 || strcmp(key, "value") == 0 || strcmp(key, "content") == 0 || strcmp(key, "output_text") == 0 || strcmp(key, "delta") == 0) {
         continue;
       }
       collectResponseText(kv.value(), out);
@@ -1496,11 +1514,11 @@ void typeReplyOverUSB(const String& text) {
 void viewAssistantReplyInteractive() {
   auto showAssistant = [&]() {
     lcdShowAssistantReplyWindow();
-    lcdStatusLine(";/.:scroll ,/:toggle GO:type ENTER:exit");
+    lcdStatusLine(";/ up . down ,/ toggle s sleep GO type ENTER exit");
   };
   auto showUser = [&]() {
     lcdShowUserPromptView();
-    lcdStatusLine(",/:toggle GO:type AI ENTER:exit");
+    lcdStatusLine(",/ toggle s sleep GO type AI ENTER exit");
   };
 
   bool showingAssistant = true;
@@ -1508,7 +1526,8 @@ void viewAssistantReplyInteractive() {
   markActivity();
 
   bool prevEnter = false;
-  bool prevGo    = false;
+  bool prevGo = false;
+  bool manualSleepHold = false;  // prevents immediate wake when 's' triggers sleep
 
   // for edge-detect on ';' and '.'
   std::vector<char> prevHeld;
@@ -1523,6 +1542,15 @@ void viewAssistantReplyInteractive() {
     bool inputActive = hasKeyboardActivity(ks) || goNow;
     if (displaySleeping) {
       if (!inputActive) {
+        manualSleepHold = false;
+        prevHeld = ks.word;
+        prevEnter = ks.enter;
+        prevGo = goNow;
+        delay(60);
+        continue;
+      }
+      if (manualSleepHold) {
+        // user is still holding 's'; stay asleep until released
         prevHeld = ks.word;
         prevEnter = ks.enter;
         prevGo = goNow;
@@ -1574,20 +1602,23 @@ void viewAssistantReplyInteractive() {
         }
       }
 
-        if (!alreadyHeld) {
-          if (c_now == ',' || c_now == '/') {
-            showingAssistant = !showingAssistant;
-            if (showingAssistant) {
-              showAssistant();
-            } else {
-              showUser();
-            }
-            markActivity();
-          } else if (showingAssistant) {
-            if (c_now == ';') {
-              if (scrollOffset > 0) {
-                markActivity();
-                scrollOffset--;
+      if (!alreadyHeld) {
+        if (c_now == ',' || c_now == '/') {
+          showingAssistant = !showingAssistant;
+          if (showingAssistant) {
+            showAssistant();
+          } else {
+            showUser();
+          }
+          markActivity();
+        } else if (c_now == 's' || c_now == 'S') {
+          manualSleepHold = true;
+          enterDisplaySleep();
+        } else if (showingAssistant) {
+          if (c_now == ';') {
+            if (scrollOffset > 0) {
+              markActivity();
+              scrollOffset--;
               lcdShowAssistantReplyWindow();
             }
           } else if (c_now == '.') {
@@ -1602,7 +1633,7 @@ void viewAssistantReplyInteractive() {
     }
 
     prevHeld = currHeld;
-    delay(80); // slow-ish poll so you don't overshoot instantly
+    delay(80);  // slow-ish poll so you don't overshoot instantly
   }
 }
 
@@ -1730,8 +1761,8 @@ String readPromptFromKeyboard() {
       if (M5Cardputer.Mic.record(chunk, VOICE_CHUNK_SAMPLES, VOICE_SAMPLE_RATE)) {
         markActivity();
         size_t remaining = (voiceSampleCount < VOICE_MAX_SAMPLES)
-                         ? (VOICE_MAX_SAMPLES - voiceSampleCount)
-                         : 0;
+                             ? (VOICE_MAX_SAMPLES - voiceSampleCount)
+                             : 0;
         if (remaining > 0 && voiceTempFile) {
           size_t toCopy = remaining < VOICE_CHUNK_SAMPLES ? remaining : VOICE_CHUNK_SAMPLES;
           if (!appendSamplesToVoiceFile(chunk, toCopy)) {
@@ -1837,25 +1868,21 @@ String readPromptFromKeyboard() {
           // backspace/delete from keycode
           markActivity();
           removeLast();
-        }
-        else if (code == '\t') {
+        } else if (code == '\t') {
           // tab => 4 spaces
           markActivity();
           inputBuffer += "    ";
-        }
-        else if (code == '\n') {
+        } else if (code == '\n') {
           // newline in ks.word means Enter
           markActivity();
           String finalPrompt = inputBuffer;
           finalPrompt.trim();
           return finalPrompt;
-        }
-        else if (code >= 0x20 && code <= 0x7E) {
+        } else if (code >= 0x20 && code <= 0x7E) {
           // printable ASCII
           markActivity();
           inputBuffer += (char)code;
-        }
-        else {
+        } else {
           // debug unknown stuff like function-key combos
           Serial.print("Unmapped key code: 0x");
           Serial.println(code, HEX);
@@ -2032,9 +2059,7 @@ void renderStatusLineInner(bool force) {
     }
   }
 
-  bool needsRedraw = force ||
-                     text != lastRenderedStatusText ||
-                     newOffset != lastRenderedStatusOffset;
+  bool needsRedraw = force || text != lastRenderedStatusText || newOffset != lastRenderedStatusOffset;
   if (!needsRedraw) {
     updateHeaderBattery(force);
     return;
