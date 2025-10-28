@@ -161,6 +161,11 @@ const int TTS_VOLUME_STEP = 16;
 volatile bool ttsCancelRequested = false;
 TaskHandle_t ttsTaskHandle = nullptr;
 volatile bool ttsPrefetchPending = false;
+volatile bool ttsPauseRequested = false;
+volatile bool ttsPaused = false;
+size_t ttsResumeOffset = 0;
+String ttsResumePath = "";
+volatile bool ttsPlaybackActive = false;
 #if defined(ARDUINO_ARCH_ESP32)
 volatile bool ttsStatusDirty = false;
 String ttsPendingStatus = "";
@@ -439,13 +444,17 @@ struct TtsJobContext {
   bool useCache;
   String cachedPath;
   bool playAfterDownload;
+  size_t startOffset;
 };
 
 void ttsWorkerTask(void* param);
-bool startTtsTask(const String& sanitizedText, bool useCache, bool playAfterDownload, const String& cachedPath);
+bool startTtsTask(const String& sanitizedText, bool useCache, bool playAfterDownload, const String& cachedPath, size_t startOffset = 0);
 void startTtsPrefetch(const String& reply);
 void postTtsStatus(const String& msg);
 void pumpTtsStatus();
+void requestTtsPause();
+void resumeTtsIfPaused();
+void speakLastAssistantReply();
 
 // ------------------------------------------------------------
 // Voice helper utilities
@@ -1064,9 +1073,11 @@ void adjustTtsVolume(int delta) {
   postTtsStatus("Volume " + String(ttsVolume));
 }
 
-bool playTtsFromSD(const String& path) {
+bool playTtsFromSD(const String& path, size_t startOffset, size_t& outResumeOffset, bool& outPaused) {
+  outResumeOffset = startOffset;
+  outPaused = false;
   if (!mountSD()) {
-  postTtsStatus("Voice storage error");
+    postTtsStatus("Voice storage error");
     return false;
   }
   File f = SD.open(path, FILE_READ);
@@ -1082,6 +1093,21 @@ bool playTtsFromSD(const String& path) {
     unmountSD();
     return false;
   }
+
+  if (startOffset > 0 && startOffset < fileSize) {
+    if (!f.seek(startOffset)) {
+      postTtsStatus("Voice seek error");
+      f.close();
+      unmountSD();
+      return false;
+    }
+  } else if (startOffset >= fileSize) {
+    postTtsStatus("Voice done");
+    f.close();
+    unmountSD();
+    return true;
+  }
+  outResumeOffset = f.position();
 
   const size_t BUFFER_COUNT = 3;
   const size_t CHUNK_BYTES_OPTIONS[] = { 16384, 12288, 8192, 4096 };
@@ -1148,6 +1174,8 @@ bool playTtsFromSD(const String& path) {
   bool firstChunk = true;
   bool fileDone = false;
   bool cancelled = false;
+  bool pausePending = false;
+  bool paused = false;
   if (!M5Cardputer.Speaker.isEnabled()) {
     M5Cardputer.Speaker.begin();
   }
@@ -1166,6 +1194,10 @@ bool playTtsFromSD(const String& path) {
   const int playbackChannel = 0;
 
   while (true) {
+    if (!pausePending && ttsPauseRequested) {
+      ttsPauseRequested = false;
+      pausePending = true;
+    }
     if (ttsCancelRequested) {
       cancelled = true;
       M5Cardputer.Speaker.stop();
@@ -1178,6 +1210,16 @@ bool playTtsFromSD(const String& path) {
       inFlightOrder.pop();
       buffers[freedIndex].inUse = false;
       recordedInFlight--;
+    }
+
+    if (pausePending) {
+      if (playingNow == 0) {
+        M5Cardputer.Speaker.stop();
+        paused = true;
+        break;
+      }
+      delay(6);
+      continue;
     }
 
     if (!fileDone && recordedInFlight < BUFFER_COUNT) {
@@ -1219,6 +1261,7 @@ bool playTtsFromSD(const String& path) {
             buffers[bufferIndex].inUse = true;
             inFlightOrder.push(bufferIndex);
             recordedInFlight++;
+            outResumeOffset = f.position();
             continue;
           }
         }
@@ -1244,11 +1287,17 @@ bool playTtsFromSD(const String& path) {
     delay(6);
   }
 
+  size_t finalOffset = f.position();
   f.close();
   unmountSD();
   M5Cardputer.Speaker.stop();
 
   freeBuffers();
+  outResumeOffset = finalOffset;
+  outPaused = paused;
+  if (paused) {
+    return true;
+  }
   return !cancelled;
 }
 
@@ -1286,26 +1335,46 @@ void ttsWorkerTask(void* param) {
 
   if (readyToPlay && !ttsCancelRequested) {
     if (shouldPlay) {
-      String statusBefore = statusBaseLine;
-      if (!playTtsFromSD(audioPath)) {
-        if (!ttsCancelRequested && statusBaseLine == statusBefore) {
+      size_t resumeOffset = ctx->startOffset;
+      bool pausedPlayback = false;
+      bool success = playTtsFromSD(audioPath, ctx->startOffset, resumeOffset, pausedPlayback);
+    if (pausedPlayback) {
+      ttsPaused = true;
+      ttsResumeOffset = resumeOffset;
+      ttsResumePath = audioPath;
+      postTtsStatus("Voice paused");
+      ttsPlaybackActive = false;
+    } else {
+      ttsPaused = false;
+      ttsResumeOffset = 0;
+      ttsResumePath = "";
+        if (!success && !ttsCancelRequested) {
           postTtsStatus("Voice error");
+        } else if (!ttsCancelRequested) {
+          postTtsStatus("Voice done");
         }
-      } else if (!ttsCancelRequested) {
-        postTtsStatus("Voice done");
       }
     } else {
+      ttsPaused = false;
+      ttsResumeOffset = 0;
+      ttsResumePath = "";
+      ttsPlaybackActive = false;
       postTtsStatus("Voice ready");
     }
   }
 
   if (ttsCancelRequested) {
     postTtsStatus("Voice cancelled");
+    ttsPaused = false;
+    ttsResumeOffset = 0;
+    ttsResumePath = "";
   }
 
   ledExitBusy();
   ttsBusy = false;
   ttsCancelRequested = false;
+  ttsPauseRequested = false;
+  ttsPlaybackActive = false;
   ttsTaskHandle = nullptr;
   bool launchPending = ttsPrefetchPending;
   ctx.reset();
@@ -1316,7 +1385,7 @@ void ttsWorkerTask(void* param) {
   vTaskDelete(nullptr);
 }
 
-bool startTtsTask(const String& sanitizedText, bool useCache, bool playAfterDownload, const String& cachedPath) {
+bool startTtsTask(const String& sanitizedText, bool useCache, bool playAfterDownload, const String& cachedPath, size_t startOffset) {
   if (ttsBusy) {
     return false;
   }
@@ -1332,11 +1401,25 @@ bool startTtsTask(const String& sanitizedText, bool useCache, bool playAfterDown
     sanitizedText,
     useCache,
     cachedPath,
-    playAfterDownload
+    playAfterDownload,
+    startOffset
   };
 
   ttsCancelRequested = false;
   ttsBusy = true;
+  ttsPaused = false;
+  ttsPauseRequested = false;
+  if (!playAfterDownload) {
+    ttsResumeOffset = 0;
+    ttsResumePath = "";
+  } else if (startOffset == 0) {
+    ttsResumeOffset = 0;
+    ttsResumePath = "";
+  } else {
+    ttsResumeOffset = startOffset;
+    ttsResumePath = cachedPath;
+  }
+  ttsPlaybackActive = playAfterDownload;
   markActivity();
 
 #if defined(ARDUINO_ARCH_ESP32)
@@ -1369,7 +1452,11 @@ bool startTtsTask(const String& sanitizedText, bool useCache, bool playAfterDown
   }
 
   if (playAfterDownload) {
-    postTtsStatus(useCache ? "Voice playing" : "Voice loading");
+    if (startOffset > 0) {
+      postTtsStatus("Voice resuming");
+    } else {
+      postTtsStatus(useCache ? "Voice playing" : "Voice loading");
+    }
   } else {
     postTtsStatus("Caching voice");
   }
@@ -1380,6 +1467,8 @@ bool startTtsTask(const String& sanitizedText, bool useCache, bool playAfterDown
 void startTtsPrefetch(const String& reply) {
   if (reply.isEmpty()) return;
   if (isMuted) return;
+  ttsPauseRequested = false;
+  ttsPaused = false;
   if (ttsBusy) {
     ttsPrefetchPending = true;
     return;
@@ -1389,7 +1478,7 @@ void startTtsPrefetch(const String& reply) {
   bool useCache = ttsAudioReady && !ttsCachedPath.isEmpty() && sanitized == ttsCachedText;
 
   ttsPrefetchPending = false;
-  startTtsTask(sanitized, useCache, false, ttsCachedPath);
+  startTtsTask(sanitized, useCache, false, ttsCachedPath, 0);
 }
 
 void postTtsStatus(const String& msg) {
@@ -1421,10 +1510,43 @@ void pumpTtsStatus() {
 #endif
 }
 
+void requestTtsPause() {
+  if (!ttsBusy || !ttsPlaybackActive || ttsPauseRequested) {
+    return;
+  }
+  if (!M5Cardputer.Speaker.isPlaying()) {
+    return;
+  }
+  ttsPauseRequested = true;
+  postTtsStatus("Voice pausing");
+}
+
+void resumeTtsIfPaused() {
+  if (!ttsPaused) {
+    return;
+  }
+  if (ttsBusy) {
+    return;
+  }
+  if (!ttsAudioReady || ttsCachedPath.isEmpty()) {
+    ttsPaused = false;
+    ttsResumeOffset = 0;
+    ttsResumePath = "";
+    postTtsStatus("Voice not ready");
+    return;
+  }
+  speakLastAssistantReply();
+}
+
 void clearTtsCache() {
   ttsAudioReady = false;
   ttsCachedText = "";
   ttsCachedPath = "";
+  ttsPaused = false;
+  ttsPauseRequested = false;
+  ttsResumeOffset = 0;
+  ttsResumePath = "";
+  ttsPlaybackActive = false;
   if (mountSD()) {
     if (SD.exists(TTS_CACHE_PATH)) {
       SD.remove(TTS_CACHE_PATH);
@@ -1451,7 +1573,12 @@ void speakLastAssistantReply() {
   Serial.println("TTS request text: " + sanitizedReply);
   bool useCache = ttsAudioReady && !ttsCachedPath.isEmpty() && sanitizedReply == ttsCachedText;
 
-  if (!startTtsTask(sanitizedReply, useCache, true, ttsCachedPath)) {
+  size_t startOffset = 0;
+  if (ttsPaused && useCache && ttsResumeOffset > 0 && !ttsResumePath.isEmpty() && ttsResumePath == ttsCachedPath) {
+    startOffset = ttsResumeOffset;
+  }
+
+  if (!startTtsTask(sanitizedReply, useCache, true, ttsCachedPath, startOffset)) {
     // startTtsTask already emitted status.
     return;
   }
@@ -1598,8 +1725,7 @@ void renderStatusLine(bool force);
 void setLedColor(uint8_t r, uint8_t g, uint8_t b);
 void clearTtsCache();
 bool downloadTtsAudio(const String& text, String& outPath);
-bool playTtsFromSD(const String& path);
-void speakLastAssistantReply();
+bool playTtsFromSD(const String& path, size_t startOffset, size_t& outResumeOffset, bool& outPaused);
 
 void maybeUpdateBatteryIndicator() {
   renderStatusLineInner(false);
@@ -2512,13 +2638,13 @@ void viewAssistantReplyInteractive() {
   auto showAssistant = [&](bool updateStatus = true) {
     lcdShowAssistantReplyWindow();
     if (updateStatus) {
-      lcdStatusLine(";/ up . down ,/ toggle v voice -/ vol=+/ c cancel s sleep GO type ENTER exit");
+      lcdStatusLine(";/ up . down ,/ toggle v voice p pause -/ vol=+/ c cancel s sleep GO type ENTER exit");
     }
   };
   auto showUser = [&](bool updateStatus = true) {
     lcdShowUserPromptView();
     if (updateStatus) {
-      lcdStatusLine(",/ toggle v voice -/ vol=+/ c cancel s sleep GO type AI ENTER exit");
+      lcdStatusLine(",/ toggle v voice p pause -/ vol=+/ c cancel s sleep GO type AI ENTER exit");
     }
   };
 
@@ -2538,6 +2664,7 @@ void viewAssistantReplyInteractive() {
     maybeUpdateLed();
     maybeUpdateBatteryIndicator();
     checkDisplaySleep();
+    pumpTtsStatus();
     pumpTtsStatus();
     pumpTtsStatus();
     auto ks = M5Cardputer.Keyboard.keysState();
@@ -2625,9 +2752,17 @@ void viewAssistantReplyInteractive() {
           markActivity();
           if (ttsBusy) {
             ttsCancelRequested = true;
+            ttsPauseRequested = false;
+            ttsPaused = false;
+            ttsResumeOffset = 0;
+            ttsResumePath = "";
             M5Cardputer.Speaker.stop();
-            postTtsStatus("Stopping voice");
+            postTtsStatus("Voice stopping");
           } else {
+            ttsPaused = false;
+            ttsPauseRequested = false;
+            ttsResumeOffset = 0;
+            ttsResumePath = "";
             postTtsStatus("Voice idle");
           }
         } else if (c_now == '-' || c_now == '_') {
@@ -2636,6 +2771,17 @@ void viewAssistantReplyInteractive() {
         } else if (c_now == '=' || c_now == '+') {
           markActivity();
           adjustTtsVolume(TTS_VOLUME_STEP);
+        } else if (c_now == 'p' || c_now == 'P') {
+          markActivity();
+          if (ttsBusy && ttsPlaybackActive) {
+            requestTtsPause();
+          } else if (ttsPaused) {
+            resumeTtsIfPaused();
+          } else if (ttsBusy) {
+            postTtsStatus("Voice loading");
+          } else {
+            postTtsStatus("Voice idle");
+          }
         } else if (c_now == 's' || c_now == 'S') {
           manualSleepHold = true;
           enterDisplaySleep();
