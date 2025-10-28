@@ -2610,6 +2610,35 @@ String parseAssistantReply(const String& rawJson) {
   return text;
 }
 
+String extractFirstCodeBlock(const String& text) {
+  int firstFence = text.indexOf("```");
+  if (firstFence < 0) {
+    return "";
+  }
+
+  int contentStart = firstFence + 3;
+  int newlineAfterFence = text.indexOf('\n', contentStart);
+  if (newlineAfterFence < 0) {
+    return "";
+  }
+
+  int secondFence = text.indexOf("```", newlineAfterFence + 1);
+  if (secondFence < 0) {
+    return "";
+  }
+
+  int codeStart = newlineAfterFence + 1;
+  if (codeStart >= secondFence) {
+    return "";
+  }
+
+  String code = text.substring(codeStart, secondFence);
+  while (code.endsWith("\r") || code.endsWith("\n")) {
+    code.remove(code.length() - 1);
+  }
+  return code;
+}
+
 // ------------------------------------------------------------
 // USB HID typing of assistant reply
 // ------------------------------------------------------------
@@ -2781,6 +2810,20 @@ void viewAssistantReplyInteractive() {
             postTtsStatus("Voice loading");
           } else {
             postTtsStatus("Voice idle");
+          }
+        } else if (c_now == 'x' || c_now == 'X') {
+          markActivity();
+          String code = extractFirstCodeBlock(lastAssistantReply);
+          if (code.length() == 0) {
+            lcdStatusLine("No code block.");
+          } else {
+            lcdStatusLine("Typing code...");
+            typeReplyOverUSB(code);
+            if (showingAssistant) {
+              showAssistant(false);
+            } else {
+              showUser(false);
+            }
           }
         } else if (c_now == 's' || c_now == 'S') {
           manualSleepHold = true;
