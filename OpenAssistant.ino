@@ -1151,6 +1151,25 @@ bool playTtsFromSD(const String& path) {
   const int playbackChannel = 0;
 
   while (true) {
+    M5Cardputer.update();
+    auto ks = M5Cardputer.Keyboard.keysState();
+    bool cancelNow = false;
+    for (char key : ks.word) {
+      if (key == 'c' || key == 'C') {
+        cancelNow = true;
+        break;
+      }
+    }
+    if (cancelNow) {
+      markActivity();
+      lcdStatusLine("TTS cancelled.");
+      M5Cardputer.Speaker.stop();
+      freeBuffers();
+      f.close();
+      unmountSD();
+      return false;
+    }
+
     size_t playingNow = M5Cardputer.Speaker.isPlaying(playbackChannel);
     while (recordedInFlight > playingNow && !inFlightOrder.empty()) {
       size_t freedIndex = inFlightOrder.front();
@@ -1206,7 +1225,6 @@ bool playTtsFromSD(const String& path) {
       break;
     }
 
-    M5Cardputer.update();
     maybeUpdateLed();
     maybeUpdateBatteryIndicator();
     checkDisplaySleep();
@@ -2343,13 +2361,13 @@ void viewAssistantReplyInteractive() {
   auto showAssistant = [&](bool updateStatus = true) {
     lcdShowAssistantReplyWindow();
     if (updateStatus) {
-      lcdStatusLine(";/ up . down ,/ toggle v voice -/ vol=+/ s sleep GO type ENTER exit");
+      lcdStatusLine(";/ up . down ,/ toggle v voice -/ vol=+/ c cancel s sleep GO type ENTER exit");
     }
   };
   auto showUser = [&](bool updateStatus = true) {
     lcdShowUserPromptView();
     if (updateStatus) {
-      lcdStatusLine(",/ toggle v voice -/ vol=+/ s sleep GO type AI ENTER exit");
+      lcdStatusLine(",/ toggle v voice -/ vol=+/ c cancel s sleep GO type AI ENTER exit");
     }
   };
 
