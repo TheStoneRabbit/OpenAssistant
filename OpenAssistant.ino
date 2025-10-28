@@ -30,6 +30,10 @@
 #include <M5Cardputer.h>
 #include <vector>
 #include <queue>
+#if defined(ARDUINO_ARCH_ESP32)
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#endif
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -154,6 +158,14 @@ bool ttsBusy = false;
 bool isMuted = false;
 uint8_t ttsVolume = 255;
 const int TTS_VOLUME_STEP = 16;
+volatile bool ttsCancelRequested = false;
+TaskHandle_t ttsTaskHandle = nullptr;
+volatile bool ttsPrefetchPending = false;
+#if defined(ARDUINO_ARCH_ESP32)
+volatile bool ttsStatusDirty = false;
+String ttsPendingStatus = "";
+portMUX_TYPE ttsStatusMux = portMUX_INITIALIZER_UNLOCKED;
+#endif
 
 // ------------------------------------------------------------
 // Utility: trim whitespace from both ends of String
@@ -421,6 +433,19 @@ String sanitizeForTts(const String& input) {
   }
   return sanitized;
 }
+
+struct TtsJobContext {
+  String sanitizedText;
+  bool useCache;
+  String cachedPath;
+  bool playAfterDownload;
+};
+
+void ttsWorkerTask(void* param);
+bool startTtsTask(const String& sanitizedText, bool useCache, bool playAfterDownload, const String& cachedPath);
+void startTtsPrefetch(const String& reply);
+void postTtsStatus(const String& msg);
+void pumpTtsStatus();
 
 // ------------------------------------------------------------
 // Voice helper utilities
@@ -840,11 +865,11 @@ static bool readChunkedBodyToFile(WiFiClientSecure& client, File& file) {
 
 bool downloadTtsAudio(const String& text, String& outPath) {
   if (OPENAI_API_KEY.isEmpty()) {
-    lcdStatusLine("TTS requires OPENAI_KEY");
+    postTtsStatus("Voice key missing");
     return false;
   }
   if (text.isEmpty()) {
-    lcdStatusLine("TTS: empty text");
+    postTtsStatus("No voice text");
     return false;
   }
 
@@ -853,22 +878,14 @@ bool downloadTtsAudio(const String& text, String& outPath) {
     Serial.println("TTS: sanitized input to remove unsupported characters.");
     Serial.println("  original: " + text);
     Serial.println("  sanitized: " + sanitizedText);
-    String preview = sanitizedText;
-    preview.replace('\n', ' ');
-    preview.replace('\r', ' ');
-    preview.replace('\t', ' ');
-    if (preview.length() > 60) {
-      preview = preview.substring(0, 57) + "...";
-    }
-    lcdStatusLine("TTS sanitized*: " + preview);
   }
 
   if (!mountSD()) {
-    lcdStatusLine("TTS: SD mount failed");
+    postTtsStatus("Voice storage error");
     return false;
   }
   if (!ensureDirectory(TTS_CACHE_DIR)) {
-    lcdStatusLine("TTS: cache dir ensure failed");
+    postTtsStatus("Voice storage error");
     unmountSD();
     return false;
   }
@@ -878,7 +895,7 @@ bool downloadTtsAudio(const String& text, String& outPath) {
   }
   File audioFile = SD.open(TTS_CACHE_PATH, FILE_WRITE);
   if (!audioFile) {
-    lcdStatusLine("TTS: cache file open failed");
+    postTtsStatus("Voice storage error");
     unmountSD();
     return false;
   }
@@ -897,7 +914,7 @@ bool downloadTtsAudio(const String& text, String& outPath) {
   httpsClient.setTimeout(15000);
 
   if (!httpsClient.connect(OPENAI_HOST, OPENAI_PORT)) {
-    lcdStatusLine("TTS: HTTPS connect FAIL");
+    postTtsStatus("Voice connect fail");
     audioFile.close();
     unmountSD();
     return false;
@@ -962,7 +979,7 @@ bool downloadTtsAudio(const String& text, String& outPath) {
     }
     if (!headersFinished) {
       if (millis() - lastRead > TTS_DOWNLOAD_TIMEOUT_MS) {
-        lcdStatusLine("TTS: header timeout");
+        postTtsStatus("Voice timeout");
         httpsClient.stop();
         audioFile.close();
         unmountSD();
@@ -981,7 +998,7 @@ bool downloadTtsAudio(const String& text, String& outPath) {
     }
   }
   if (statusCode != 200) {
-    lcdStatusLine("TTS HTTP error: " + String(statusCode));
+    postTtsStatus("Voice HTTP " + String(statusCode));
     String errorPreview;
     unsigned long errStart = millis();
     while (httpsClient.available() && errorPreview.length() < 256) {
@@ -1003,7 +1020,7 @@ bool downloadTtsAudio(const String& text, String& outPath) {
       if (display.length() > 60) {
         display = display.substring(0, 57) + "...";
       }
-      lcdStatusLine("TTS err detail: " + display);
+      Serial.println("TTS HTTP detail: " + display);
     }
     httpsClient.stop();
     audioFile.close();
@@ -1023,14 +1040,13 @@ bool downloadTtsAudio(const String& text, String& outPath) {
   audioFile.close();
 
   if (!ok) {
-    lcdStatusLine("TTS: body read failed");
+    postTtsStatus("Voice read error");
     if (SD.exists(TTS_CACHE_PATH)) {
       SD.remove(TTS_CACHE_PATH);
     }
     unmountSD();
     return false;
   }
-  lcdStatusLine("TTS: Downloaded " + String(audioFile.size()) + " bytes.");
 
   outPath = String(TTS_CACHE_PATH);
   unmountSD();
@@ -1045,23 +1061,23 @@ void adjustTtsVolume(int delta) {
   if (M5Cardputer.Speaker.isEnabled()) {
     M5Cardputer.Speaker.setVolume(ttsVolume);
   }
-  lcdStatusLine("TTS volume: " + String(ttsVolume));
+  postTtsStatus("Volume " + String(ttsVolume));
 }
 
 bool playTtsFromSD(const String& path) {
   if (!mountSD()) {
-    lcdStatusLine("TTS playback: SD mount failed");
+  postTtsStatus("Voice storage error");
     return false;
   }
   File f = SD.open(path, FILE_READ);
   if (!f) {
-    lcdStatusLine("TTS playback: file open failed");
+    postTtsStatus("Voice file error");
     unmountSD();
     return false;
   }
   size_t fileSize = f.size();
   if (fileSize == 0) {
-    lcdStatusLine("TTS playback: file empty");
+    postTtsStatus("Voice file empty");
     f.close();
     unmountSD();
     return false;
@@ -1121,7 +1137,7 @@ bool playTtsFromSD(const String& path) {
   }
 
   if (chunkBytes == 0) {
-    lcdStatusLine("TTS playback: alloc failed");
+    postTtsStatus("Voice memory error");
     f.close();
     unmountSD();
     return false;
@@ -1131,8 +1147,7 @@ bool playTtsFromSD(const String& path) {
   size_t recordedInFlight = 0;
   bool firstChunk = true;
   bool fileDone = false;
-  unsigned long lastUpdate = millis();
-
+  bool cancelled = false;
   if (!M5Cardputer.Speaker.isEnabled()) {
     M5Cardputer.Speaker.begin();
   }
@@ -1151,23 +1166,10 @@ bool playTtsFromSD(const String& path) {
   const int playbackChannel = 0;
 
   while (true) {
-    M5Cardputer.update();
-    auto ks = M5Cardputer.Keyboard.keysState();
-    bool cancelNow = false;
-    for (char key : ks.word) {
-      if (key == 'c' || key == 'C') {
-        cancelNow = true;
-        break;
-      }
-    }
-    if (cancelNow) {
-      markActivity();
-      lcdStatusLine("TTS cancelled.");
+    if (ttsCancelRequested) {
+      cancelled = true;
       M5Cardputer.Speaker.stop();
-      freeBuffers();
-      f.close();
-      unmountSD();
-      return false;
+      break;
     }
 
     size_t playingNow = M5Cardputer.Speaker.isPlaying(playbackChannel);
@@ -1192,7 +1194,10 @@ bool playTtsFromSD(const String& path) {
           if (samples == 0) {
             fileDone = true;
           } else {
-            markActivity();
+            if (ttsCancelRequested) {
+              fileDone = true;
+              break;
+            }
             bool queued = M5Cardputer.Speaker.playRaw(
               buffers[bufferIndex].data,
               samples,
@@ -1203,7 +1208,7 @@ bool playTtsFromSD(const String& path) {
               firstChunk
             );
             if (!queued) {
-              lcdStatusLine("TTS playback: queue failed");
+              postTtsStatus("Voice queue error");
               M5Cardputer.Speaker.stop();
               freeBuffers();
               f.close();
@@ -1218,6 +1223,11 @@ bool playTtsFromSD(const String& path) {
           }
         }
       }
+      if (ttsCancelRequested) {
+        cancelled = true;
+        M5Cardputer.Speaker.stop();
+        break;
+      }
     }
 
     playingNow = M5Cardputer.Speaker.isPlaying(playbackChannel);
@@ -1225,15 +1235,13 @@ bool playTtsFromSD(const String& path) {
       break;
     }
 
-    maybeUpdateLed();
-    maybeUpdateBatteryIndicator();
-    checkDisplaySleep();
-    markActivity();
-    delay(6);
-
-    if (millis() - lastUpdate > 50) {
-      lastUpdate = millis();
+    if (ttsCancelRequested) {
+      cancelled = true;
+      M5Cardputer.Speaker.stop();
+      break;
     }
+
+    delay(6);
   }
 
   f.close();
@@ -1241,7 +1249,176 @@ bool playTtsFromSD(const String& path) {
   M5Cardputer.Speaker.stop();
 
   freeBuffers();
+  return !cancelled;
+}
+
+void ttsWorkerTask(void* param) {
+  std::unique_ptr<TtsJobContext> ctx(static_cast<TtsJobContext*>(param));
+  String audioPath = ctx->cachedPath;
+  ttsCancelRequested = false;
+
+  ledEnterBusy();
+  markActivity();
+
+  bool shouldPlay = ctx->playAfterDownload;
+  if (ctx->useCache) {
+    postTtsStatus(shouldPlay ? "Voice playing" : "Voice ready");
+  } else {
+    postTtsStatus(shouldPlay ? "Voice loading" : "Caching voice");
+  }
+
+  bool readyToPlay = ctx->useCache;
+  if (!ctx->useCache) {
+    String downloadedPath;
+    if (!downloadTtsAudio(ctx->sanitizedText, downloadedPath) || ttsCancelRequested) {
+      readyToPlay = false;
+      if (!ttsCancelRequested) {
+        postTtsStatus("Voice error");
+      }
+    } else {
+      ttsCachedText = ctx->sanitizedText;
+      ttsCachedPath = downloadedPath;
+      ttsAudioReady = true;
+      audioPath = downloadedPath;
+      readyToPlay = true;
+    }
+  }
+
+  if (readyToPlay && !ttsCancelRequested) {
+    if (shouldPlay) {
+      String statusBefore = statusBaseLine;
+      if (!playTtsFromSD(audioPath)) {
+        if (!ttsCancelRequested && statusBaseLine == statusBefore) {
+          postTtsStatus("Voice error");
+        }
+      } else if (!ttsCancelRequested) {
+        postTtsStatus("Voice done");
+      }
+    } else {
+      postTtsStatus("Voice ready");
+    }
+  }
+
+  if (ttsCancelRequested) {
+    postTtsStatus("Voice cancelled");
+  }
+
+  ledExitBusy();
+  ttsBusy = false;
+  ttsCancelRequested = false;
+  ttsTaskHandle = nullptr;
+  bool launchPending = ttsPrefetchPending;
+  ctx.reset();
+  if (launchPending) {
+    ttsPrefetchPending = false;
+    startTtsPrefetch(lastAssistantReply);
+  }
+  vTaskDelete(nullptr);
+}
+
+bool startTtsTask(const String& sanitizedText, bool useCache, bool playAfterDownload, const String& cachedPath) {
+  if (ttsBusy) {
+    return false;
+  }
+
+  if (!playAfterDownload && useCache) {
+    // Already cached; nothing to do.
+    ttsAudioReady = true;
+    postTtsStatus("Voice ready");
+    return true;
+  }
+
+  auto ctx = new TtsJobContext{
+    sanitizedText,
+    useCache,
+    cachedPath,
+    playAfterDownload
+  };
+
+  ttsCancelRequested = false;
+  ttsBusy = true;
+  markActivity();
+
+#if defined(ARDUINO_ARCH_ESP32)
+  BaseType_t created = xTaskCreatePinnedToCore(
+    ttsWorkerTask,
+    "ttsWorker",
+    8192,
+    ctx,
+    1,
+    &ttsTaskHandle,
+    1
+  );
+#else
+  BaseType_t created = xTaskCreate(
+    ttsWorkerTask,
+    "ttsWorker",
+    8192,
+    ctx,
+    1,
+    &ttsTaskHandle
+  );
+#endif
+
+  if (created != pdPASS) {
+    ttsBusy = false;
+    ttsTaskHandle = nullptr;
+    delete ctx;
+    postTtsStatus("Voice error");
+    return false;
+  }
+
+  if (playAfterDownload) {
+    postTtsStatus(useCache ? "Voice playing" : "Voice loading");
+  } else {
+    postTtsStatus("Caching voice");
+  }
+
   return true;
+}
+
+void startTtsPrefetch(const String& reply) {
+  if (reply.isEmpty()) return;
+  if (isMuted) return;
+  if (ttsBusy) {
+    ttsPrefetchPending = true;
+    return;
+  }
+
+  String sanitized = sanitizeForTts(reply);
+  bool useCache = ttsAudioReady && !ttsCachedPath.isEmpty() && sanitized == ttsCachedText;
+
+  ttsPrefetchPending = false;
+  startTtsTask(sanitized, useCache, false, ttsCachedPath);
+}
+
+void postTtsStatus(const String& msg) {
+#if defined(ARDUINO_ARCH_ESP32)
+  if (ttsTaskHandle != nullptr && xTaskGetCurrentTaskHandle() == ttsTaskHandle) {
+    portENTER_CRITICAL(&ttsStatusMux);
+    ttsPendingStatus = msg;
+    ttsStatusDirty = true;
+    portEXIT_CRITICAL(&ttsStatusMux);
+    return;
+  }
+#endif
+  lcdStatusLine(msg);
+}
+
+void pumpTtsStatus() {
+#if defined(ARDUINO_ARCH_ESP32)
+  if (!ttsStatusDirty) return;
+  String msg;
+  portENTER_CRITICAL(&ttsStatusMux);
+  if (ttsStatusDirty) {
+    msg = ttsPendingStatus;
+    ttsStatusDirty = false;
+  }
+  portEXIT_CRITICAL(&ttsStatusMux);
+  if (msg.length() > 0) {
+    lcdStatusLine(msg);
+  }
+#endif
 }
 
 void clearTtsCache() {
@@ -1262,61 +1439,22 @@ void speakLastAssistantReply() {
     return;
   }
   if (ttsBusy) {
-    lcdStatusLine("TTS busy...");
+    postTtsStatus("Voice busy");
     return;
   }
   if (lastAssistantReply.isEmpty()) {
-    lcdStatusLine("TTS: nothing to say.");
+    postTtsStatus("No voice text");
     return;
   }
-
-  ttsBusy = true;
-  ledEnterBusy();
-  markActivity();
 
   String sanitizedReply = sanitizeForTts(lastAssistantReply);
   Serial.println("TTS request text: " + sanitizedReply);
   bool useCache = ttsAudioReady && !ttsCachedPath.isEmpty() && sanitizedReply == ttsCachedText;
-  String audioPath = ttsCachedPath;
 
-  if (!useCache) {
-    String preview = sanitizedReply;
-    bool modified = sanitizedReply != lastAssistantReply;
-    preview.replace('\n', ' ');
-    preview.replace('\r', ' ');
-    preview.replace('\t', ' ');
-    if (preview.length() > 60) {
-      preview = preview.substring(0, 57) + "...";
-    }
-    String statusMsg = modified ? "TTS fetch*: " : "TTS fetch: ";
-    statusMsg += preview;
-    lcdStatusLine(statusMsg);
-    markActivity();
-    if (!downloadTtsAudio(sanitizedReply, audioPath)) {
-      lcdStatusLine("TTS fetch failed.");
-      ledExitBusy();
-      ttsBusy = false;
-      return;
-    }
-    ttsCachedText = sanitizedReply;
-    ttsCachedPath = audioPath;
-    ttsAudioReady = true;
-  } else {
-    lcdStatusLine("TTS: playing cached audio...");
+  if (!startTtsTask(sanitizedReply, useCache, true, ttsCachedPath)) {
+    // startTtsTask already emitted status.
+    return;
   }
-
-  markActivity();
-  String statusBeforePlayback = statusBaseLine;
-  if (!playTtsFromSD(audioPath)) {
-    if (statusBaseLine == statusBeforePlayback) {
-      lcdStatusLine("TTS playback failed.");
-    }
-  } else {
-    lcdStatusLine("TTS finished.");
-  }
-
-  ledExitBusy();
-  ttsBusy = false;
 }
 
 // ------------------------------------------------------------
@@ -1664,6 +1802,7 @@ String readSimpleTextLine(const String& statusMsg) {
   lcdStatusLine(statusMsg);
 
   while (true) {
+    pumpTtsStatus();
     M5Cardputer.update();
     maybeUpdateLed();
     maybeUpdateBatteryIndicator();
@@ -1991,14 +2130,28 @@ bool wifiInteractiveSetup() {
 
   lcdClearAll();
   lcdHeader("WiFi Networks");
-  int maxDisplay = networkCount < 6 ? networkCount : 6;
-  int listY = PROMPT_AREA_Y;
+  int listStartY = HEADER_HEIGHT + CONTENT_MARGIN_Y;
+  if (listStartY >= PROMPT_AREA_Y) {
+    listStartY = HEADER_HEIGHT;
+  }
   int lineHeight = lineHeightForSize(CONTENT_TEXT_SIZE);
+  int listAreaHeight = PROMPT_AREA_Y - listStartY;
+  if (listAreaHeight < lineHeight) {
+    listAreaHeight = lineHeight;
+  }
+  int maxDisplay = listAreaHeight / lineHeight;
+  if (maxDisplay < 1) {
+    maxDisplay = 1;
+  }
+  if (maxDisplay > networkCount) {
+    maxDisplay = networkCount;
+  }
+  M5Cardputer.Display.fillRect(0, listStartY, SCREEN_WIDTH, listAreaHeight, BLACK);
   M5Cardputer.Display.setTextSize(CONTENT_TEXT_SIZE);
   M5Cardputer.Display.setTextColor(WHITE, BLACK);
   for (int i = 0; i < maxDisplay; ++i) {
-    int y = listY + i * lineHeight;
-    if (y >= SCREEN_HEIGHT) break;
+    int y = listStartY + i * lineHeight;
+    if (y + lineHeight > PROMPT_AREA_Y) break;
     String line = String(i) + ": " + WiFi.SSID(i);
     if (WiFi.encryptionType(i) != WIFI_AUTH_OPEN) {
       line += " *";
@@ -2010,12 +2163,10 @@ bool wifiInteractiveSetup() {
     M5Cardputer.Display.setCursor(CONTENT_MARGIN_X, y);
     M5Cardputer.Display.print(line);
   }
-  if (networkCount > maxDisplay) {
-    int y = listY + maxDisplay * lineHeight;
-    if (y < SCREEN_HEIGHT) {
-      M5Cardputer.Display.setCursor(CONTENT_MARGIN_X, y);
-      M5Cardputer.Display.print("... (" + String(networkCount - maxDisplay) + " more)");
-    }
+  int moreStartY = listStartY + maxDisplay * lineHeight;
+  if (networkCount > maxDisplay && moreStartY + lineHeight <= PROMPT_AREA_Y) {
+    M5Cardputer.Display.setCursor(CONTENT_MARGIN_X, moreStartY);
+    M5Cardputer.Display.print("... (" + String(networkCount - maxDisplay) + " more)");
   }
 
   String selection = readSimpleTextLine("Select network # or name (blank=cancel)");
@@ -2387,6 +2538,8 @@ void viewAssistantReplyInteractive() {
     maybeUpdateLed();
     maybeUpdateBatteryIndicator();
     checkDisplaySleep();
+    pumpTtsStatus();
+    pumpTtsStatus();
     auto ks = M5Cardputer.Keyboard.keysState();
     bool goNow = M5Cardputer.BtnA.isPressed();
     bool inputActive = hasKeyboardActivity(ks) || goNow;
@@ -2467,6 +2620,15 @@ void viewAssistantReplyInteractive() {
             showAssistant(false);
           } else {
             showUser(false);
+          }
+        } else if (c_now == 'c' || c_now == 'C') {
+          markActivity();
+          if (ttsBusy) {
+            ttsCancelRequested = true;
+            M5Cardputer.Speaker.stop();
+            postTtsStatus("Stopping voice");
+          } else {
+            postTtsStatus("Voice idle");
           }
         } else if (c_now == '-' || c_now == '_') {
           markActivity();
@@ -2658,6 +2820,7 @@ String readPromptFromKeyboard() {
 
         while (M5Cardputer.Mic.isRecording()) {
           maybeUpdateLed();
+          pumpTtsStatus();
           delay(5);
         }
         M5Cardputer.Mic.end();
@@ -2883,9 +3046,15 @@ void loop() {
   ttsAudioReady = false;
   ttsCachedText = "";
   ttsCachedPath = "";
+  if (ttsBusy) {
+    ttsCancelRequested = true;
+  }
 
   // 6. Prepare wrapped lines for scrolling UI
   prepareReplyLinesFromText(reply);
+
+  // 6b. Kick off background TTS download so audio is ready when requested.
+  startTtsPrefetch(reply);
 
   // 7. Show reply, enter interactive scroll/GO mode
   lcdShowAssistantReplyWindow();
