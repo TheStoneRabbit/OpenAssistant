@@ -2297,7 +2297,7 @@ bool wifiInteractiveSetup() {
     M5Cardputer.Display.print("... (" + String(networkCount - maxDisplay) + " more)");
   }
 
-  String selection = readSimpleTextLine("Select network # or name (blank=cancel)");
+  String selection = readSimpleTextLine("Type network name (blank=cancel)");
   selection.trim();
   if (selection.length() == 0 || selection.equalsIgnoreCase("exit")) {
     lcdStatusLine("WiFi setup cancelled.");
