@@ -2104,18 +2104,29 @@ void lcdShowPromptEditing(const String& current) {
   int lineHeight = lineHeightForSize(PROMPT_TEXT_SIZE);
   int maxLines = PROMPT_AREA_HEIGHT / lineHeight;
   if (maxLines < 1) maxLines = 1;
-  int cursorLine = std::min((int)lines.size() - 1, maxLines - 1);
+
+  int totalLines = lines.size();
+  int firstLine = 0;
+  if (totalLines > maxLines) {
+    firstLine = totalLines - maxLines;
+  }
+  int cursorLineIndex = totalLines > 0 ? totalLines - 1 : 0;
+  int cursorRow = cursorLineIndex - firstLine;
+  if (cursorRow < 0) cursorRow = 0;
+  if (cursorRow >= maxLines) cursorRow = maxLines - 1;
 
   M5Cardputer.Display.setTextColor(WHITE, BLACK);
-  for (int i = 0; i < maxLines && i < (int)lines.size(); ++i) {
-    int y = startY + i * lineHeight;
+  for (int row = 0; row < maxLines; ++row) {
+    int lineIndex = firstLine + row;
+    if (lineIndex >= totalLines) break;
+    int y = startY + row * lineHeight;
     if (y >= startY + PROMPT_AREA_HEIGHT) break;
     int x = indent;
-    String textLine = lines[i];
+    String textLine = lines[lineIndex];
     M5Cardputer.Display.setCursor(x, y);
     M5Cardputer.Display.setTextColor(WHITE, BLACK);
     M5Cardputer.Display.print(textLine);
-    if (i == cursorLine) {
+    if (row == cursorRow) {
       int cursorX = x + M5Cardputer.Display.textWidth(textLine.c_str());
       int cursorMax = SCREEN_WIDTH - CONTENT_MARGIN_X - (PROMPT_TEXT_SIZE * 6);
       if (cursorX > cursorMax) cursorX = cursorMax;
