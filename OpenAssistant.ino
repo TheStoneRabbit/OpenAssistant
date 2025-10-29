@@ -441,6 +441,12 @@ String sanitizeForTts(const String& input) {
   return sanitized;
 }
 
+String sanitizeForHidTyping(const String& input) {
+  String sanitized = sanitizeForTts(input);
+  sanitized.replace('\r', ' ');
+  return sanitized;
+}
+
 struct TtsJobContext {
   String sanitizedText;
   bool useCache;
@@ -2719,9 +2725,14 @@ String extractFirstCodeBlock(const String& text) {
 void typeReplyOverUSB(const String& text) {
   // Dump reply into the connected host as keystrokes.
   // Requires TinyUSB HID keyboard support.
-  for (size_t i = 0; i < text.length(); i++) {
-    char c = text[i];
-    HidKeyboard.print(c);  // print single char
+  String sanitized = sanitizeForHidTyping(text);
+  for (size_t i = 0; i < sanitized.length(); i++) {
+    char c = sanitized[i];
+    if (c == '\n') {
+      HidKeyboard.write('\n');
+    } else {
+      HidKeyboard.write(c);
+    }
     delay(5);              // mild pacing
     if ((i & 0x0F) == 0) {
       markActivity();
