@@ -46,8 +46,9 @@ Lines starting with `#` are treated as comments. The file is read during boot; m
    - Audio is streamed to `/oa_tmp/voice.raw` on the SD card; if the card fills or a write fails you’ll see `Voice write failed`.
    - When recording stops, the sketch uploads the audio to OpenAI, receives the transcript, and appends it to the prompt. You can edit further before submitting.
 4. Type `/wifi` to scan for nearby networks and pick one directly from the device when the SD config isn’t working.
-5. Type `/context` (and press `ENTER`) any time you want to archive the current conversation:
-   - The whole chat history, including the system prompt, is written to `transcripts/context_<timestamp>.txt`.
+5. Type `/context` (and press `ENTER`) any time you want to archive the current conversation, or `/context my_session` to pick the filename:
+   - With no name provided the chat is saved to `transcripts/context_<timestamp>.txt`.
+   - Custom names accept letters, numbers, `-`, and `_`; `.txt` is added automatically and existing files get a timestamp suffix.
    - A fresh conversation context is started automatically.
 6. After the assistant replies:
    - `;` scrolls up and `.` scrolls down through the AI response.

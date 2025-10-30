@@ -497,11 +497,86 @@ bool appendSamplesToVoiceFile(const int16_t* samples, size_t sampleCount) {
   return true;
 }
 
-String generateTranscriptPath() {
+String sanitizeTranscriptFilename(const String& rawName) {
+  String trimmed = rawName;
+  trimmed.trim();
+  String sanitized = "";
+
+  for (size_t i = 0; i < trimmed.length(); ++i) {
+    char c = trimmed.charAt(i);
+    if (isalnum(static_cast<unsigned char>(c))) {
+      sanitized += c;
+    } else if (c == ' ') {
+      sanitized += '_';
+    } else if (c == '-' || c == '_') {
+      sanitized += c;
+    } else if (c == '.' && sanitized.length() > 0) {
+      sanitized += c;
+    }
+  }
+
+  while (sanitized.length() > 0 && sanitized.charAt(0) == '.') {
+    sanitized.remove(0, 1);
+  }
+
+  while (sanitized.length() > 0 && sanitized.charAt(sanitized.length() - 1) == '.') {
+    sanitized.remove(sanitized.length() - 1);
+  }
+
+  const size_t MAX_NAME_LEN = 40;
+  if (sanitized.length() > MAX_NAME_LEN) {
+    sanitized = sanitized.substring(0, MAX_NAME_LEN);
+  }
+
+  return sanitized;
+}
+
+String ensureTxtExtension(const String& baseName) {
+  String lower = baseName;
+  lower.toLowerCase();
+  if (lower.length() >= 4 && lower.substring(lower.length() - 4) == ".txt") {
+    return baseName;
+  }
+  return baseName + ".txt";
+}
+
+String appendSuffixBeforeExtension(const String& baseName, const String& suffix) {
+  int dotIndex = baseName.lastIndexOf('.');
+  if (dotIndex <= 0) {
+    return baseName + suffix;
+  }
+  String prefix = baseName.substring(0, dotIndex);
+  String extension = baseName.substring(dotIndex);
+  return prefix + suffix + extension;
+}
+
+String generateTranscriptPath(const String& customName) {
+  String sanitized = sanitizeTranscriptFilename(customName);
+  if (sanitized.length() == 0) {
+    unsigned long stamp = millis();
+    char name[64];
+    snprintf(name, sizeof(name), "%s/context_%lu.txt", TRANSCRIPT_DIR, (unsigned long)stamp);
+    return String(name);
+  }
+
+  String finalName = ensureTxtExtension(sanitized);
+  String fullPath = String(TRANSCRIPT_DIR) + "/" + finalName;
+  if (!SD.exists(fullPath)) {
+    return fullPath;
+  }
+
   unsigned long stamp = millis();
-  char name[64];
-  snprintf(name, sizeof(name), "%s/context_%lu.txt", TRANSCRIPT_DIR, (unsigned long)stamp);
-  return String(name);
+  String suffix = "_" + String((unsigned long)stamp);
+  String uniqueName = appendSuffixBeforeExtension(finalName, suffix);
+  String uniquePath = String(TRANSCRIPT_DIR) + "/" + uniqueName;
+  if (!SD.exists(uniquePath)) {
+    return uniquePath;
+  }
+
+  unsigned long fallbackStamp = millis();
+  char fallback[64];
+  snprintf(fallback, sizeof(fallback), "%s/context_%lu.txt", TRANSCRIPT_DIR, (unsigned long)fallbackStamp);
+  return String(fallback);
 }
 
 bool ensureDirectory(const char* path) {
@@ -532,7 +607,7 @@ void unmountSD() {
   sdMounted = false;
 }
 
-bool saveContextTranscript(String& outPath) {
+bool saveContextTranscript(String& outPath, const String& desiredName = "") {
   if (!mountSD()) {
     Serial.println("Failed to mount SD for transcript.");
     return false;
@@ -543,7 +618,7 @@ bool saveContextTranscript(String& outPath) {
     return false;
   }
 
-  String filePath = generateTranscriptPath();
+  String filePath = generateTranscriptPath(desiredName);
   File f = SD.open(filePath, FILE_WRITE);
   if (!f) {
     Serial.println("Failed to open transcript file.");
@@ -3273,9 +3348,22 @@ void loop() {
     markActivity();
     return;
   }
-  if (userMsg.equalsIgnoreCase("/context")) {
+  String trimmedMsg = userMsg;
+  trimmedMsg.trim();
+  String commandWord = trimmedMsg;
+  String commandArg = "";
+  int spaceIndex = trimmedMsg.indexOf(' ');
+  if (spaceIndex >= 0) {
+    commandWord = trimmedMsg.substring(0, spaceIndex);
+    commandArg = trimmedMsg.substring(spaceIndex + 1);
+    commandArg.trim();
+  }
+  String loweredCommand = commandWord;
+  loweredCommand.toLowerCase();
+
+  if (loweredCommand == "/context") {
     String savedPath;
-    bool saved = saveContextTranscript(savedPath);
+    bool saved = saveContextTranscript(savedPath, commandArg);
     if (saved) {
       resetConversationState();
       lcdShowPromptEditing("");
@@ -3284,7 +3372,7 @@ void loop() {
       if (slash >= 0 && slash < (int)basename.length() - 1) {
         basename = basename.substring(slash + 1);
       }
-      lcdStatusLine("Context saved: " + basename);
+      lcdStatusLine(basename);
     } else {
       lcdStatusLine("Context save failed.");
     }
@@ -3292,7 +3380,7 @@ void loop() {
     delay(900);
     return;
   }
-  if (userMsg.equalsIgnoreCase("/wifi")) {
+  if (loweredCommand == "/wifi" && commandArg.length() == 0) {
     bool result = wifiInteractiveSetup();
     markActivity();
     delay(600);
